@@ -1,13 +1,16 @@
 /* LevelUp English — single-page app (no build step) */
 (function () {
   "use strict";
-  const { SKILLS, LEVELS, SKILL_TIPS, TEST_BANK, UNITS } = window.LU_DATA;
+  const { SKILLS, LEVELS, SKILL_TIPS, UNITS } = window.LU_DATA;
+  const GEN = window.LU_GEN;
   const KEY = "levelup-english-v1";
   const TEST_LENGTH = 20;
+  const LEVEL_TEST_PER_SKILL = 4;
   const PASS_PCT = 70;
+  const SKILL_IDS = SKILLS.map((s) => s.id);
 
   /* ---------- state ---------- */
-  const defaultState = () => ({ level: null, placement: null, units: {}, history: [] });
+  const defaultState = () => ({ level: null, placement: null, units: {}, history: [], seen: [], practice: { answered: 0, correct: 0, best: 0 } });
   function load() {
     try {
       const s = JSON.parse(localStorage.getItem(KEY));
@@ -15,7 +18,11 @@
     } catch (e) { return defaultState(); }
   }
   let state = load();
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ } }
+  let seen = new Set(state.seen || []);
+  function save() {
+    state.seen = Array.from(seen).slice(-2000);
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+  }
 
   /* ---------- helpers ---------- */
   const app = document.getElementById("app");
@@ -29,8 +36,22 @@
   const shuffle = (arr) => { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
   const norm = (s) => String(s).toLowerCase().replace(/[’‘`]/g, "'").replace(/[.,!?;:"]/g, "").replace(/\s+/g, " ").trim();
   const fmtDate = (iso) => new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-  const levelBadge = (n, big) => { const L = lvl(n); return `<span class="lvl-badge${big ? " big" : ""}" style="--lc:${L.color}">${L.code}</span>`; };
+  const pad = (n) => String(n).padStart(2, "0");
   const levelProgress = (n) => { const us = unitsOf(n); return Math.round((us.filter((u) => unitDone(u.id)).length / us.length) * 100); };
+  const toEx = (q) => ({ t: q.audio ? "listen" : "mc", q: q.q, o: q.o, a: q.a, audio: q.audio, passage: q.passage, x: q.x, skill: q.skill });
+
+  const ICON_PLAY = `<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>`;
+  const ICON_SPEAKER = `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6h3l4-3v10l-4-3H2z" fill="currentColor"/><path d="M11 5.5c1 .8 1 4.2 0 5M12.8 3.8c2 1.8 2 6.6 0 8.4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>`;
+  const ICON_MIC = `<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="1.5" width="5" height="9" rx="2.5" fill="currentColor"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>`;
+
+  /* CEFR ruler used across pages */
+  function ruler(current, opts = {}) {
+    return `<div class="ruler${opts.compact ? " compact" : ""}" role="img" aria-label="CEFR scale${current ? ", current level " + lvl(current).code : ""}">
+      ${LEVELS.map((L) => `<div class="ruler-seg${L.n === current ? " on" : ""}${current && L.n < current ? " past" : ""}">
+        <span class="ruler-code">${L.code}</span>${opts.compact ? "" : `<span class="ruler-name">${L.name}</span>`}
+      </div>`).join("")}
+    </div>`;
+  }
 
   /* ---------- speech ---------- */
   const hasTTS = "speechSynthesis" in window;
@@ -53,13 +74,14 @@
     if (b) { e.preventDefault(); speak(b.getAttribute("data-speak"), parseFloat(b.getAttribute("data-rate")) || 0.95); }
   });
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const sayBtn = (text, label) => `<button class="say" data-speak="${esc(text)}" aria-label="Listen">${ICON_SPEAKER}${label ? `<span>${label}</span>` : ""}</button>`;
 
   function audioBox(text) {
-    if (!hasTTS) return `<div class="audio-box"><span class="muted">Audio is not supported in this browser. Transcript: “${esc(text)}”</span></div>`;
-    return `<div class="audio-box">
-      <button class="btn btn-audio" data-speak="${esc(text)}"><span class="ico">▶</span> Play audio</button>
-      <button class="btn btn-ghost btn-sm" data-speak="${esc(text)}" data-rate="0.7">Slow</button>
-      <span class="muted small">Listen, then answer. You can replay.</span></div>`;
+    if (!hasTTS) return `<div class="audio"><span class="muted">Audio isn't supported in this browser. Transcript: “${esc(text)}”</span></div>`;
+    return `<div class="audio">
+      <button class="btn btn-sm" data-speak="${esc(text)}">${ICON_PLAY} Play recording</button>
+      <button class="btn btn-sm btn-line" data-speak="${esc(text)}" data-rate="0.7">Slower</button>
+      <span class="audio-note">Replay as often as you need.</span></div>`;
   }
 
   /* ---------- router ---------- */
@@ -68,6 +90,7 @@
     [/^\/test$/, testIntro],
     [/^\/test\/run$/, testRun],
     [/^\/results$/, results],
+    [/^\/practice$/, practicePage],
     [/^\/levels$/, levelsPage],
     [/^\/level\/([1-6])$/, (n) => levelPage(+n)],
     [/^\/level\/([1-6])\/test$/, (n) => levelTest(+n)],
@@ -78,6 +101,7 @@
     const raw = location.hash.replace(/^#/, "") || "/";
     const [path, query] = raw.split("?");
     if (hasTTS) speechSynthesis.cancel();
+    document.onkeydown = null;
     for (const [re, fn] of routes) {
       const m = path.match(re);
       if (m) { fn(...m.slice(1), new URLSearchParams(query || "")); updateNav(path); window.scrollTo(0, 0); return; }
@@ -88,101 +112,116 @@
     $$(".nav a[data-nav]").forEach((a) => a.classList.toggle("active", path.startsWith(a.getAttribute("data-nav"))));
     $(".nav").classList.remove("open");
   }
-  function notFound() { app.innerHTML = `<section class="narrow center"><h1>Page not found</h1><p><a class="btn btn-primary" href="#/">Go home</a></p></section>`; }
+  function notFound() { app.innerHTML = `<section class="page-head"><h1 class="display">Page not found</h1><p><a class="btn" href="#/">Go home</a></p></section>`; }
 
   /* =========================================================
      HOME
      ========================================================= */
   function home() {
     const has = state.level != null;
-    const ladder = LEVELS.slice().reverse().map((L) => `
-      <div class="ladder-step${has && state.level === L.n ? " current" : ""}" style="--lc:${L.color}">
-        <span class="lvl-badge" style="--lc:${L.color}">${L.code}</span>
-        <span class="ladder-name">${L.name}</span>
-        ${has && state.level === L.n ? `<span class="you">You are here</span>` : ""}
-      </div>`).join("");
+    const spec = GEN.generate({ lvl: 3 + Math.floor(Math.random() * 2), skill: "grammar" });
 
     app.innerHTML = `
     <section class="hero">
-      <div class="hero-text">
-        <span class="eyebrow">Personalised English learning · CEFR A1–C2</span>
-        <h1>Find your level.<br>Follow your path.<br><span class="accent">Speak with confidence.</span></h1>
-        <p class="lead">Take a free adaptive placement test that measures your grammar, vocabulary, reading and listening. Get your level and a study plan built around your strengths and gaps — with lessons, exercises and speaking practice for every level.</p>
-        <div class="cta-row">
+      <div class="hero-main">
+        <p class="kicker">English placement &amp; study &middot; CEFR A1&ndash;C2</p>
+        <h1 class="display">Find out where your English stands. <em>Then improve it.</em></h1>
+        <p class="lede">An adaptive test measures your grammar, vocabulary, reading and listening, and places you on the CEFR scale. Then you get a study plan with lessons and exercises for your level. The questions are generated as you go, so you can retest and practise as often as you like.</p>
+        <div class="actions">
           ${has
-            ? `<a class="btn btn-primary btn-lg" href="#/level/${state.level}">Continue ${lvl(state.level).code} ${lvl(state.level).name}</a><a class="btn btn-ghost btn-lg" href="#/test">Retake level test</a>`
-            : `<a class="btn btn-primary btn-lg" href="#/test">Take the free level test</a><a class="btn btn-ghost btn-lg" href="#/levels">Browse levels</a>`}
+            ? `<a class="btn btn-lg" href="#/level/${state.level}">Continue at ${lvl(state.level).code}</a><a class="btn btn-lg btn-line" href="#/practice?l=${state.level}">Practise now</a>`
+            : `<a class="btn btn-lg" href="#/test">Take the level test</a><a class="btn btn-lg btn-line" href="#/practice">Practise without a test</a>`}
         </div>
-        <p class="meta">${TEST_LENGTH} questions · about 15 minutes · no sign-up · progress saved on this device</p>
+        <dl class="facts">
+          <div><dt>20</dt><dd>questions that adapt to your answers</dd></div>
+          <div><dt>4</dt><dd>skills, each scored separately</dd></div>
+          <div><dt>8,000+</dt><dd>different questions, so retakes don't repeat</dd></div>
+        </dl>
       </div>
-      <div class="hero-card card"><div class="ladder">${ladder}</div></div>
+      <aside class="specimen" id="specimen">
+        <div class="specimen-head"><span>Specimen question</span><span>${lvl(spec.lvl).code} &middot; Grammar</span></div>
+        <p class="specimen-q">${esc(spec.q)}</p>
+        <ol class="specimen-opts">${spec.o.map((o, i) => `<li><button data-i="${i}"><span class="key">${"ABCD"[i]}</span>${esc(o)}</button></li>`).join("")}</ol>
+        <p class="specimen-note" id="spec-note">Choose an answer.</p>
+      </aside>
     </section>
 
-    <section class="section">
-      <h2 class="section-title">How it works</h2>
-      <div class="grid-3">
-        <div class="card step"><span class="step-n">1</span><h3>Assess</h3><p>An adaptive test gets harder when you answer correctly and easier when you don't, so it finds your true level quickly.</p></div>
-        <div class="card step"><span class="step-n">2</span><h3>Measure</h3><p>See your overall CEFR level plus a separate score for grammar, vocabulary, reading and listening.</p></div>
-        <div class="card step"><span class="step-n">3</span><h3>Study</h3><p>Follow a recommended plan of units with lessons, vocabulary, reading, exercises and speaking — then pass the level test to move up.</p></div>
-      </div>
+    <section class="band">
+      <div class="band-head"><h2 class="h-section">The scale</h2><p class="muted">Six levels from the Common European Framework of Reference.${has ? ` You are at <b>${lvl(state.level).code}</b>.` : ""}</p></div>
+      ${ruler(state.level)}
     </section>
 
-    <section class="section">
-      <h2 class="section-title">Skills we measure</h2>
-      <div class="grid-4">
-        ${SKILLS.map((s) => `<div class="card skill-card skill-${s.id}"><span class="skill-ico">${s.icon}</span><h3>${s.name}</h3><p>${s.desc}</p></div>`).join("")}
-      </div>
+    <section class="band">
+      <h2 class="h-section">How it works</h2>
+      <ol class="steps">
+        <li><span class="step-n">01</span><h3>Assess</h3><p>Answer correctly and the next question is harder. Get one wrong and it's easier. After 20 questions the test has found your level.</p></li>
+        <li><span class="step-n">02</span><h3>Measure</h3><p>You get a CEFR level, plus a separate estimate for grammar, vocabulary, reading and listening, so you can see where you're strong and where you're weak.</p></li>
+        <li><span class="step-n">03</span><h3>Study</h3><p>Work through your level's units, then practise as much as you want. Pass the level test to move up.</p></li>
+      </ol>
     </section>
 
-    <section class="section">
-      <h2 class="section-title">Six levels, one clear path</h2>
-      <div class="grid-3">
+    <section class="band">
+      <h2 class="h-section">Levels</h2>
+      <div class="table-list">
         ${LEVELS.map((L) => `
-          <a class="card level-card" href="#/level/${L.n}" style="--lc:${L.color}">
-            <div class="level-card-top">${levelBadge(L.n)}<h3>${L.name}</h3></div>
-            <p>${L.summary}</p>
-            <span class="link">${unitsOf(L.n).length} units →</span>
+          <a class="row-link" href="#/level/${L.n}">
+            <span class="code">${L.code}</span>
+            <span class="row-title">${L.name}</span>
+            <span class="row-desc">${L.summary}</span>
+            <span class="row-meta">${unitsOf(L.n).length} units &rarr;</span>
           </a>`).join("")}
       </div>
     </section>`;
+
+    const btns = $$("#specimen button");
+    btns.forEach((b) => (b.onclick = () => {
+      const i = +b.dataset.i;
+      btns.forEach((x, j) => { x.disabled = true; x.parentElement.classList.toggle("is-key", j === spec.a); x.parentElement.classList.toggle("is-wrong", j === i && i !== spec.a); });
+      $("#spec-note").innerHTML = (i === spec.a ? "<b>Correct.</b> " : "<b>Not quite.</b> ") + esc(spec.x) + ` <a href="#/practice?l=${spec.lvl}&s=grammar">More like this &rarr;</a>`;
+    }));
   }
 
   /* =========================================================
-     PLACEMENT TEST (adaptive)
+     PLACEMENT TEST (adaptive, generated)
      ========================================================= */
   let T = null;
 
   function testIntro() {
+    const prev = state.placement;
     app.innerHTML = `
-    <section class="narrow">
-      <span class="eyebrow">Placement test</span>
-      <h1>Find your English level</h1>
-      <p class="lead">This test adapts to you. Each correct answer brings a harder question; each wrong answer an easier one. Don't guess — choose <b>“I don't know”</b> if you're not sure. That gives a more accurate result.</p>
-      <div class="grid-2 test-facts">
-        <div class="card"><h3>${TEST_LENGTH} questions</h3><p class="muted">About 15 minutes</p></div>
-        <div class="card"><h3>4 skills</h3><p class="muted">Grammar, vocabulary, reading, listening</p></div>
+    <section class="page-head narrow">
+      <p class="kicker">Placement test</p>
+      <h1 class="display">What's your level?</h1>
+      <p class="lede">The test adapts as you go: a correct answer makes the next question harder, and a wrong answer makes it easier. If you don't know an answer, choose <b>I don't know</b>. Guessing makes the result less accurate. You'll get new questions every time you take it.</p>
+      <dl class="facts facts-inline">
+        <div><dt>${TEST_LENGTH}</dt><dd>questions</dd></div>
+        <div><dt>~15</dt><dd>minutes</dd></div>
+        <div><dt>4</dt><dd>skills</dd></div>
+      </dl>
+      <div class="note">
+        <p><b>Listening questions play audio.</b> ${hasTTS ? "Turn your sound on and check it works:" : "Your browser can't play audio, so you'll see transcripts instead."}</p>
+        ${hasTTS ? `<button class="btn btn-sm btn-line" data-speak="Hello. If you can hear this, your audio is working.">${ICON_PLAY} Test audio</button>` : ""}
       </div>
-      <div class="card notice">
-        <b>🎧 Turn your sound on.</b> Listening questions play audio. ${hasTTS ? "Click <i>Test audio</i> to check." : "Your browser doesn't support audio — transcripts will be shown instead."}
-        ${hasTTS ? `<button class="btn btn-ghost btn-sm" data-speak="Hello! If you can hear this, your audio is working.">Test audio</button>` : ""}
-      </div>
-      <button class="btn btn-primary btn-lg" id="start">Start the test</button>
+      <div class="actions"><button class="btn btn-lg" id="start">${prev ? "Start a new test" : "Start the test"}</button>
+        ${prev ? `<a class="btn btn-lg btn-line" href="#/results">See last result (${lvl(prev.level).code})</a>` : ""}</div>
+      <p class="muted small">Keyboard: press A–D or 1–4 to choose, Enter for the next question.</p>
     </section>`;
     $("#start").onclick = () => {
-      T = { cur: 2, asked: new Set(), answers: [], total: TEST_LENGTH };
+      T = { cur: 2, answers: [], total: TEST_LENGTH, seen: new Set() };
       location.hash = "#/test/run";
     };
   }
 
-  function pickQuestion() {
-    const count = (s) => T.answers.filter((a) => a.skill === s).length;
-    for (const d of [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]) {
-      const L = T.cur + d;
-      if (L < 1 || L > 6) continue;
-      const pool = shuffle(TEST_BANK.filter((q) => q.lvl === L && !T.asked.has(q.id)));
-      if (pool.length) { pool.sort((a, b) => count(a.skill) - count(b.skill)); return pool[0]; }
-    }
-    return null;
+  function nextTestQuestion() {
+    const counts = {};
+    SKILL_IDS.forEach((s) => (counts[s] = T.answers.filter((a) => a.skill === s).length));
+    const min = Math.min(...Object.values(counts));
+    const sk = shuffle(SKILL_IDS.filter((s) => counts[s] === min))[0];
+    // avoid repeats within this test and (where possible) across previous tests
+    const combined = new Set([...seen, ...T.seen]);
+    const q = GEN.generate({ lvl: T.cur, skill: sk }, combined);
+    T.seen.add(GEN.keyOf(q));
+    return q;
   }
 
   function testRun() {
@@ -191,27 +230,23 @@
   }
 
   function renderTestQuestion() {
-    const q = pickQuestion();
-    if (!q) return finishTest();
+    const q = nextTestQuestion();
     const n = T.answers.length + 1;
     let selected = null;
-    const showText = q.audio && !hasTTS;
     app.innerHTML = `
-    <section class="test-wrap">
-      <div class="test-top"><span>Question <b>${n}</b> of ${T.total}</span><span class="chip chip-${q.skill}">${skill(q.skill).name}</span></div>
-      <div class="progress"><div style="width:${((n - 1) / T.total) * 100}%"></div></div>
-      <div class="card qcard">
-        ${q.passage ? `<div class="passage">${esc(q.passage)}</div>` : ""}
-        ${q.audio ? audioBox(q.audio) : ""}
-        ${showText ? `<div class="passage">${esc(q.audio)}</div>` : ""}
-        <h2 class="qtext">${esc(q.q)}</h2>
-        <div class="options">${q.o.map((o, i) => `<button class="opt" data-i="${i}"><span class="opt-key">${"ABCD"[i]}</span><span>${esc(o)}</span></button>`).join("")}</div>
-        <div class="q-actions">
-          <button class="btn btn-link" id="skip">I don't know</button>
-          <button class="btn btn-primary" id="next" disabled>${n === T.total ? "Finish" : "Next →"}</button>
-        </div>
+    <section class="sheet">
+      <div class="sheet-top"><span>Question <b>${pad(n)}</b> / ${T.total}</span><span class="skill-label">${skill(q.skill).name}</span></div>
+      <div class="ticks">${Array.from({ length: T.total }, (_, i) => `<span class="${i < n - 1 ? "done" : i === n - 1 ? "now" : ""}"></span>`).join("")}</div>
+      ${q.passage ? `<div class="passage">${esc(q.passage)}</div>` : ""}
+      ${q.audio ? audioBox(q.audio) : ""}
+      ${q.audio && !hasTTS ? `<div class="passage">${esc(q.audio)}</div>` : ""}
+      <h2 class="qtext">${esc(q.q)}</h2>
+      <div class="options">${q.o.map((o, i) => `<button class="opt" data-i="${i}"><span class="key">${"ABCD"[i]}</span><span>${esc(o)}</span></button>`).join("")}</div>
+      <div class="sheet-actions">
+        <button class="btn-text" id="skip">I don't know</button>
+        <button class="btn" id="next" disabled>${n === T.total ? "Finish" : "Next"} &rarr;</button>
       </div>
-      <p class="center muted small"><a href="#/test" id="quit">Quit test</a></p>
+      <p class="sheet-foot"><a href="#/test" id="quit">Quit test</a></p>
     </section>`;
 
     const opts = $$(".opt");
@@ -220,26 +255,25 @@
     const answer = (idx) => {
       document.onkeydown = null;
       const correct = idx === q.a;
-      T.asked.add(q.id);
-      T.answers.push({ id: q.id, lvl: q.lvl, skill: q.skill, correct });
+      seen.add(GEN.keyOf(q));
+      T.answers.push({ lvl: q.lvl, skill: q.skill, correct });
       T.cur = correct ? Math.min(6, T.cur + 1) : Math.max(1, T.cur - 1);
       if (T.answers.length >= T.total) finishTest(); else { renderTestQuestion(); window.scrollTo(0, 0); }
     };
     $("#next").onclick = () => selected != null && answer(selected);
     $("#skip").onclick = () => answer(-1);
-    $("#quit").onclick = () => { T = null; document.onkeydown = null; };
+    $("#quit").onclick = () => { T = null; };
     document.onkeydown = (e) => {
-      if (!location.hash.startsWith("#/test/run")) { document.onkeydown = null; return; }
       const k = e.key.toLowerCase();
       const map = { "1": 0, "2": 1, "3": 2, "4": 3, a: 0, b: 1, c: 2, d: 3 };
-      if (k in map && map[k] < q.o.length && !e.target.closest("input,textarea")) select(map[k]);
+      if (k in map && map[k] < q.o.length) select(map[k]);
       else if (k === "enter" && selected != null) answer(selected);
     };
     if (q.audio && hasTTS) setTimeout(() => speak(q.audio), 350);
   }
 
   /* Ability estimate: each answer contributes level+0.5 if right, level-0.5 if wrong.
-     The staircase converges around the learner's ceiling, so we ignore the warm-up. */
+     The staircase converges around the learner's ceiling, so the warm-up is ignored. */
   function estimate(answers) {
     // A correct answer at the top level counts higher: there is no harder question to climb to.
     const v = answers.reduce((t, a) => t + (a.correct ? (a.lvl === 6 ? 7 : a.lvl + 0.5) : a.lvl - 0.5), 0) / answers.length;
@@ -272,112 +306,189 @@
   /* =========================================================
      RESULTS + RECOMMENDATIONS
      ========================================================= */
+  function skillRowsOf(p) {
+    return SKILLS.filter((s) => p.skills[s.id] != null).map((s) => {
+      const v = p.skills[s.id];
+      return { s, v, sl: lvl(Math.floor(v)), pct: Math.max(3, Math.min(100, ((v - 1) / 5.99) * 100)) };
+    });
+  }
+  function skillBars(rows) {
+    return `<div class="skillbars">${rows.map((r) => `
+      <div class="skillbar">
+        <span class="skillbar-name">${r.s.name}</span>
+        <span class="skillbar-track">${LEVELS.map(() => "<i></i>").join("")}<b style="width:${r.pct}%"></b></span>
+        <span class="skillbar-code">${r.sl.code}</span>
+      </div>`).join("")}</div>`;
+  }
+
   function results() {
     const p = state.placement;
     if (!p) { location.hash = "#/test"; return; }
     const L = lvl(p.level);
-    const skillRows = SKILLS.filter((s) => p.skills[s.id] != null).map((s) => {
-      const v = p.skills[s.id];
-      const sl = lvl(Math.floor(v));
-      return { s, v, sl, pct: Math.max(4, Math.min(100, ((v - 1) / 5.99) * 100)) };
-    });
-    const sorted = skillRows.slice().sort((a, b) => a.v - b.v);
-    const weakest = sorted[0];
+    const rows = skillRowsOf(p);
+    const sorted = rows.slice().sort((a, b) => a.v - b.v);
     const strongest = sorted[sorted.length - 1];
-    const weakSkills = sorted.filter((r) => r.v < p.level + 0.5 && r !== strongest).slice(0, 2);
-    const focus = weakSkills.length ? weakSkills : [weakest];
-
+    const weak = sorted.filter((r) => r.v < p.level + 0.5 && r !== strongest).slice(0, 2);
+    const focus = weak.length ? weak : [sorted[0]];
     const plan = buildPlan(p.level, focus.map((f) => f.s.id));
 
     app.innerHTML = `
-    <section class="results-head card" style="--lc:${L.color}">
+    <section class="result-head">
       <div>
-        <span class="eyebrow">Your result · ${fmtDate(p.date)}</span>
-        <h1>Your level is ${L.code} <span class="muted-strong">${L.name}</span></h1>
-        <p class="lead">${L.summary}</p>
-        <p><span class="pill">${p.band === "secure" ? "Secure " + L.code : "Developing " + L.code}</span>
-           <span class="pill pill-muted">${p.correct}/${p.total} answered correctly</span></p>
+        <p class="kicker">Result &middot; ${fmtDate(p.date)}</p>
+        <h1 class="display">Your level is <em>${L.code}</em>, ${L.name.toLowerCase()}.</h1>
+        <p class="lede">${L.summary}</p>
+        <p class="result-meta">${p.band === "secure" ? "Secure" : "Developing"} ${L.code} &middot; ${p.correct} of ${p.total} correct</p>
       </div>
-      <div class="big-badge-wrap">${levelBadge(p.level, true)}<div class="scale">${LEVELS.map((x) => `<span class="${x.n === p.level ? "on" : ""}" style="--lc:${x.color}">${x.code}</span>`).join("")}</div></div>
+      <div class="result-code" aria-hidden="true">${L.code}</div>
     </section>
+    ${ruler(p.level)}
 
-    <section class="grid-2 section">
-      <div class="card">
-        <h2>Skills breakdown</h2>
-        <div class="bars">
-          ${skillRows.map((r) => `
-            <div class="bar-row">
-              <div class="bar-label"><span>${r.s.name}</span><span class="muted">${r.sl.code}</span></div>
-              <div class="bar"><div class="bar-fill skill-bg-${r.s.id}" style="width:${r.pct}%"></div></div>
-            </div>`).join("")}
-        </div>
-        <p class="small muted">Scale A1 → C2. Each skill is estimated from the difficulty of the questions you answered correctly and incorrectly.</p>
+    <section class="cols band">
+      <div>
+        <h2 class="h-section">By skill</h2>
+        ${skillBars(rows)}
+        <p class="muted small">Each skill estimate is based on how hard the questions you got right and wrong were.</p>
       </div>
-      <div class="card">
-        <h2>What you can do at ${L.code}</h2>
-        <ul class="checks">${L.canDo.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
-        <div class="callouts">
-          <div class="callout good"><b>Strongest skill:</b> ${strongest.s.name}</div>
-          <div class="callout warn"><b>Focus on:</b> ${focus.map((f) => f.s.name).join(" & ")}</div>
-        </div>
+      <div>
+        <h2 class="h-section">At ${L.code} you can</h2>
+        <ul class="list-check">${L.canDo.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
+        <dl class="kv">
+          <div><dt>Strongest</dt><dd>${strongest.s.name}</dd></div>
+          <div><dt>Focus on</dt><dd>${focus.map((f) => f.s.name).join(" and ")}</dd></div>
+        </dl>
       </div>
     </section>
 
-    <section class="section">
-      <h2 class="section-title">Your recommended study plan</h2>
-      <div class="plan">
+    <section class="band">
+      <h2 class="h-section">Your study plan</h2>
+      <ol class="plan">
         ${plan.map((w, i) => `
-          <div class="card plan-week">
-            <span class="week">Week ${i + 1}</span>
-            <h3>${esc(w.title)}</h3>
-            <p class="muted">${esc(w.desc)}</p>
-            ${w.link ? `<a class="btn btn-sm ${i === 0 ? "btn-primary" : "btn-ghost"}" href="${w.link}">${esc(w.cta)}</a>` : ""}
-          </div>`).join("")}
-      </div>
+          <li>
+            <span class="plan-n">Week ${i + 1}</span>
+            <div><h3>${esc(w.title)}</h3><p class="muted">${esc(w.desc)}</p></div>
+            <a class="btn btn-sm ${i === 0 ? "" : "btn-line"}" href="${w.link}">${esc(w.cta)}</a>
+          </li>`).join("")}
+      </ol>
     </section>
 
-    <section class="section">
-      <h2 class="section-title">How to improve your ${focus.map((f) => f.s.name.toLowerCase()).join(" and ")}</h2>
-      <div class="grid-2">
-        ${focus.map((f) => `
-          <div class="card">
-            <h3><span class="chip chip-${f.s.id}">${f.s.name}</span> currently ${f.sl.code}</h3>
-            <ul class="tips">${SKILL_TIPS[f.s.id].map((t) => `<li>${esc(t)}</li>`).join("")}</ul>
-            <p class="small"><b>Practise it in:</b> ${unitsForSkill(f.s.id, p.level).map((u) => `<a href="#/unit/${u.id}?tab=${tabForSkill(f.s.id)}">${lvl(u.level).code} · ${esc(u.title)}</a>`).join(" · ")}</p>
-          </div>`).join("")}
-      </div>
+    <section class="band cols">
+      ${focus.map((f) => `
+        <div>
+          <h2 class="h-section">Improving your ${f.s.name.toLowerCase()} <span class="muted">(now ${f.sl.code})</span></h2>
+          <ol class="list-num">${SKILL_TIPS[f.s.id].map((t) => `<li>${esc(t)}</li>`).join("")}</ol>
+          <p><a class="btn btn-sm" href="#/practice?l=${p.level}&s=${f.s.id}">Practise ${f.s.name.toLowerCase()} at ${L.code} &rarr;</a></p>
+        </div>`).join("")}
     </section>
 
-    <section class="section cta-band card">
-      <div><h2>Ready to start?</h2><p class="muted">Your progress is saved automatically on this device.</p></div>
-      <div class="cta-row"><a class="btn btn-primary btn-lg" href="#/unit/${unitsOf(p.level)[0].id}">Start ${L.code} Unit 1</a><a class="btn btn-ghost" href="#/dashboard">My progress</a></div>
+    <section class="band cta-line">
+      <p>Your progress is saved in this browser.</p>
+      <div class="actions"><a class="btn" href="#/unit/${unitsOf(p.level)[0].id}">Start ${L.code} unit 1</a><a class="btn btn-line" href="#/test">Take a new test</a></div>
     </section>`;
   }
 
-  function tabForSkill(id) { return { grammar: "learn", vocabulary: "vocab", reading: "reading", listening: "practice" }[id]; }
-  function unitsForSkill(skillId, level) {
-    const cands = UNITS.filter((u) => u.focus.includes(skillId) && (u.level === level || u.level === level - 1));
-    return (cands.length ? cands : UNITS.filter((u) => u.level === level)).sort((a, b) => b.level - a.level).slice(0, 3);
-  }
   function buildPlan(level, focusIds) {
-    const us = unitsOf(level);
     const L = lvl(level);
     const fnames = focusIds.map((id) => skill(id).name.toLowerCase()).join(" and ");
-    const plan = us.map((u, i) => ({
+    const plan = unitsOf(level).map((u, i) => ({
       title: `Unit ${i + 1}: ${u.title}`,
-      desc: `${u.grammar.title}. Do the lesson, learn the ${u.vocab.length} key words, then score ${PASS_PCT}%+ in practice. Extra: 10 min/day of ${fnames}.`,
+      desc: `${u.grammar.title}. Read the lesson, learn the ${u.vocab.length} key words and score ${PASS_PCT}%+ on the practice. Then spend 10 minutes a day on ${fnames} in Practice.`,
       link: `#/unit/${u.id}`, cta: "Open unit"
     }));
-    if (level > 1) {
-      const rev = unitsForSkill(focusIds[0], level).find((u) => u.level === level - 1);
-      if (rev) plan.push({ title: `Review: ${lvl(level - 1).code} ${rev.title}`, desc: `Strengthen your ${skill(focusIds[0]).name.toLowerCase()} foundations with a unit from the level below.`, link: `#/unit/${rev.id}`, cta: "Review unit" });
-    }
+    plan.push({
+      title: `Targeted practice: ${fnames}`,
+      desc: `Do sets of fresh ${fnames} questions at ${L.code} until you're getting 8 out of 10 right.`,
+      link: `#/practice?l=${level}&s=${focusIds[0]}`, cta: "Practise"
+    });
     plan.push({
       title: level < 6 ? `${L.code} level test` : "C2 mastery check",
-      desc: level < 6 ? `Score ${PASS_PCT}% or more to unlock ${lvl(level + 1).code} ${lvl(level + 1).name}.` : "Confirm your mastery and keep your skills sharp.",
-      link: `#/level/${level}/test`, cta: "Take level test"
+      desc: level < 6 ? `Score ${PASS_PCT}% or more to unlock ${lvl(level + 1).code}. The questions are new every time you take it.` : "Confirm your C2 level. The questions are new every time you take it.",
+      link: `#/level/${level}/test`, cta: "Take test"
     });
     return plan;
+  }
+
+  /* =========================================================
+     UNLIMITED PRACTICE
+     ========================================================= */
+  function practicePage(params) {
+    let L = +params.get("l") || state.level || 1;
+    if (L < 1 || L > 6) L = 1;
+    let S = SKILL_IDS.includes(params.get("s")) ? params.get("s") : "";
+    const session = { answered: 0, correct: 0, streak: 0 };
+
+    app.innerHTML = `
+    <section class="page-head">
+      <p class="kicker">Practice</p>
+      <h1 class="display">Unlimited practice</h1>
+      <p class="lede">Every question is generated as you go. Choose a level and a skill, answer, check the explanation, and keep going.</p>
+    </section>
+    <section class="controls">
+      <div class="seg" role="group" aria-label="Level">${LEVELS.map((x) => `<button data-l="${x.n}" class="${x.n === L ? "on" : ""}">${x.code}</button>`).join("")}</div>
+      <div class="seg" role="group" aria-label="Skill"><button data-s="" class="${!S ? "on" : ""}">All skills</button>${SKILLS.map((s) => `<button data-s="${s.id}" class="${s.id === S ? "on" : ""}">${s.name}</button>`).join("")}</div>
+    </section>
+    <section class="stats-line" id="pstats"></section>
+    <section class="sheet sheet-wide" id="pq"></section>`;
+
+    const renderStats = () => {
+      const acc = session.answered ? Math.round((session.correct / session.answered) * 100) : 0;
+      $("#pstats").innerHTML = `
+        <div><span>Answered</span><b>${session.answered}</b></div>
+        <div><span>Accuracy</span><b>${session.answered ? acc + "%" : "—"}</b></div>
+        <div><span>Streak</span><b>${session.streak}</b></div>
+        <div><span>Best streak</span><b>${state.practice.best}</b></div>
+        <div><span>All-time answered</span><b>${state.practice.answered}</b></div>`;
+    };
+    const setParams = () => history.replaceState(null, "", `#/practice?l=${L}${S ? "&s=" + S : ""}`);
+
+    function nextQ() {
+      const q = GEN.generate({ lvl: L, skill: S || undefined }, seen);
+      let picked = null, done = false;
+      $("#pq").innerHTML = `
+        <div class="sheet-top"><span>${lvl(L).code} &middot; ${skill(q.skill).name}</span><span class="muted">Question ${session.answered + 1}</span></div>
+        ${q.passage ? `<div class="passage">${esc(q.passage)}</div>` : ""}
+        ${q.audio ? audioBox(q.audio) : ""}
+        <h2 class="qtext">${esc(q.q)}</h2>
+        <div class="options">${q.o.map((o, i) => `<button class="opt" data-i="${i}"><span class="key">${"ABCD"[i]}</span><span>${esc(o)}</span></button>`).join("")}</div>
+        <div class="feedback" id="pfb" hidden></div>
+        <div class="sheet-actions"><button class="btn-text" id="pskip">Skip</button><button class="btn" id="pgo" disabled>Check</button></div>`;
+      const opts = $$("#pq .opt");
+      const choose = (i) => { if (done) return; picked = i; opts.forEach((b, j) => b.classList.toggle("selected", j === i)); $("#pgo").disabled = false; };
+      opts.forEach((b) => (b.onclick = () => choose(+b.dataset.i)));
+      const check = () => {
+        if (done) { nextQ(); return; }
+        if (picked == null) return;
+        done = true;
+        const ok = picked === q.a;
+        session.answered++; state.practice.answered++;
+        if (ok) { session.correct++; state.practice.correct++; session.streak++; } else session.streak = 0;
+        state.practice.best = Math.max(state.practice.best, session.streak);
+        save();
+        opts.forEach((b, j) => { b.disabled = true; if (j === q.a) b.classList.add("right"); else if (j === picked) b.classList.add("wrong"); });
+        const fb = $("#pfb");
+        fb.hidden = false;
+        fb.className = "feedback " + (ok ? "ok" : "bad");
+        fb.innerHTML = `<b>${ok ? "Correct." : "Answer: " + esc(q.o[q.a]) + "."}</b> ${esc(q.x || "")}${q.audio ? `<div class="muted small">Transcript: “${esc(q.audio)}”</div>` : ""}`;
+        $("#pgo").textContent = "Next question →";
+        $("#pskip").hidden = true;
+        renderStats();
+        $("#pgo").focus();
+      };
+      $("#pgo").onclick = check;
+      $("#pskip").onclick = () => { seen.add(GEN.keyOf(q)); nextQ(); };
+      document.onkeydown = (e) => {
+        const k = e.key.toLowerCase();
+        const map = { "1": 0, "2": 1, "3": 2, "4": 3, a: 0, b: 1, c: 2, d: 3 };
+        if (k in map && map[k] < q.o.length) choose(map[k]);
+        else if (k === "enter") { e.preventDefault(); check(); }
+      };
+      if (q.audio && hasTTS) setTimeout(() => speak(q.audio), 300);
+    }
+
+    $$(".seg [data-l]").forEach((b) => (b.onclick = () => { L = +b.dataset.l; $$(".seg [data-l]").forEach((x) => x.classList.toggle("on", x === b)); setParams(); nextQ(); }));
+    $$(".seg [data-s]").forEach((b) => (b.onclick = () => { S = b.dataset.s; $$(".seg [data-s]").forEach((x) => x.classList.toggle("on", x === b)); setParams(); nextQ(); }));
+    renderStats();
+    nextQ();
   }
 
   /* =========================================================
@@ -385,73 +496,72 @@
      ========================================================= */
   function levelsPage() {
     app.innerHTML = `
-    <section>
-      <span class="eyebrow">Course</span>
-      <h1>All levels</h1>
-      <p class="lead">Six levels aligned to the Common European Framework of Reference (CEFR). ${state.level ? `You're currently at <b>${lvl(state.level).code}</b>.` : `Not sure where to start? <a href="#/test">Take the placement test</a>.`}</p>
-      <div class="levels-list">
-        ${LEVELS.map((L) => {
-          const pct = levelProgress(L.n);
-          return `
-          <a class="card level-row${state.level === L.n ? " current" : ""}" href="#/level/${L.n}" style="--lc:${L.color}">
-            ${levelBadge(L.n, true)}
-            <div class="level-row-body">
-              <h3>${L.name} ${state.level === L.n ? `<span class="pill">Your level</span>` : ""}</h3>
-              <p class="muted">${L.summary}</p>
-              <div class="mini-progress"><div style="width:${pct}%"></div></div>
-              <span class="small muted">${pct}% complete · ${unitsOf(L.n).length} units · ~${L.hours} guided hours to reach</span>
-            </div>
-          </a>`;
-        }).join("")}
-      </div>
-    </section>`;
+    <section class="page-head">
+      <p class="kicker">Course</p>
+      <h1 class="display">Levels</h1>
+      <p class="lede">Six levels aligned to the CEFR. ${state.level ? `You're at <b>${lvl(state.level).code}</b>.` : `Not sure where to start? <a href="#/test">Take the placement test</a>.`}</p>
+    </section>
+    ${ruler(state.level)}
+    <div class="table-list band">
+      ${LEVELS.map((L) => {
+        const pct = levelProgress(L.n);
+        return `
+        <a class="row-link${state.level === L.n ? " current" : ""}" href="#/level/${L.n}">
+          <span class="code">${L.code}</span>
+          <span class="row-title">${L.name}${state.level === L.n ? ` <span class="tag">Your level</span>` : ""}</span>
+          <span class="row-desc">${L.summary}<span class="row-sub">About ${L.hours} guided hours to reach this level</span></span>
+          <span class="row-meta"><span class="meter"><b style="width:${pct}%"></b></span>${pct}%</span>
+        </a>`;
+      }).join("")}
+    </div>`;
   }
 
   function levelPage(n) {
     const L = lvl(n);
     const us = unitsOf(n);
-    const best = state.history.find((h) => h.type === "level" && h.level === n);
+    const last = state.history.find((h) => h.type === "level" && h.level === n);
     app.innerHTML = `
     <nav class="crumbs"><a href="#/levels">Levels</a> / ${L.code}</nav>
-    <section class="level-head card" style="--lc:${L.color}">
-      ${levelBadge(n, true)}
+    <section class="result-head">
       <div>
-        <h1>${L.code} · ${L.name}</h1>
-        <p class="lead">${L.summary}</p>
-        <div class="mini-progress"><div style="width:${levelProgress(n)}%"></div></div>
-        <span class="small muted">${us.filter((u) => unitDone(u.id)).length} of ${us.length} units completed</span>
+        <p class="kicker">Level ${n} of 6</p>
+        <h1 class="display">${L.name}</h1>
+        <p class="lede">${L.summary}</p>
+        <p class="result-meta">${us.filter((u) => unitDone(u.id)).length} of ${us.length} units complete</p>
       </div>
+      <div class="result-code" aria-hidden="true">${L.code}</div>
     </section>
-    <section class="grid-2 section">
-      <div class="card"><h2>By the end of this level you can…</h2><ul class="checks">${L.canDo.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>
-      <div class="card">
-        <h2>Level test</h2>
-        <p class="muted">10 questions covering all four skills. Score ${PASS_PCT}% or more to ${n < 6 ? `move up to ${lvl(n + 1).code}` : "confirm C2 mastery"}.</p>
-        ${best ? `<p>Last attempt: <b>${best.score}%</b> ${best.passed ? "✅ passed" : "— not passed yet"}</p>` : ""}
-        <a class="btn btn-primary" href="#/level/${n}/test">Take ${L.code} level test</a>
+    ${ruler(n, { compact: true })}
+
+    <section class="cols band">
+      <div>
+        <h2 class="h-section">Units</h2>
+        <div class="table-list">${us.map((u, i) => unitRow(u, i)).join("")}</div>
       </div>
-    </section>
-    <section class="section">
-      <h2 class="section-title">Units</h2>
-      <div class="grid-2">
-        ${us.map((u, i) => unitCard(u, i)).join("")}
+      <div>
+        <h2 class="h-section">Goals for this level</h2>
+        <ul class="list-check">${L.canDo.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>
+        <div class="boxed">
+          <h3>Level test</h3>
+          <p class="muted">${SKILLS.length * LEVEL_TEST_PER_SKILL} new questions each time, covering all four skills. Score ${PASS_PCT}% to ${n < 6 ? `move up to ${lvl(n + 1).code}` : "confirm C2"}.</p>
+          ${last ? `<p class="small">Last attempt: <b>${last.score}%</b>, ${last.passed ? "passed" : "not passed yet"}</p>` : ""}
+          <div class="actions"><a class="btn" href="#/level/${n}/test">Take the test</a><a class="btn btn-line" href="#/practice?l=${n}">Practise ${L.code}</a></div>
+        </div>
       </div>
     </section>
     <div class="pager">
-      ${n > 1 ? `<a class="btn btn-ghost" href="#/level/${n - 1}">← ${lvl(n - 1).code}</a>` : "<span></span>"}
-      ${n < 6 ? `<a class="btn btn-ghost" href="#/level/${n + 1}">${lvl(n + 1).code} →</a>` : ""}
+      ${n > 1 ? `<a href="#/level/${n - 1}">&larr; ${lvl(n - 1).code} ${lvl(n - 1).name}</a>` : "<span></span>"}
+      ${n < 6 ? `<a href="#/level/${n + 1}">${lvl(n + 1).code} ${lvl(n + 1).name} &rarr;</a>` : ""}
     </div>`;
   }
 
-  function unitCard(u, i) {
+  function unitRow(u, i) {
     const s = state.units[u.id];
     return `
-    <a class="card unit-card" href="#/unit/${u.id}">
-      <div class="unit-card-top"><span class="small muted">Unit ${i + 1} · ${esc(u.topic)}</span>
-        ${s ? `<span class="pill ${s.done ? "" : "pill-muted"}">${s.done ? "✓ " : ""}Best ${s.best}%</span>` : `<span class="pill pill-muted">Not started</span>`}</div>
-      <h3>${esc(u.title)}</h3>
-      <p class="muted">${esc(u.grammar.title)}</p>
-      <div class="chips">${u.focus.map((f) => `<span class="chip chip-${f}">${skill(f).name}</span>`).join("")}</div>
+    <a class="row-link unit-row" href="#/unit/${u.id}">
+      <span class="code">${pad(i + 1)}</span>
+      <span class="row-title">${esc(u.title)}<span class="row-sub">${esc(u.grammar.title)}</span></span>
+      <span class="row-meta">${s ? (s.done ? `<span class="tag tag-ok">Done &middot; ${s.best}%</span>` : `Best ${s.best}%`) : "Not started"}</span>
     </a>`;
   }
 
@@ -471,122 +581,137 @@
 
     app.innerHTML = `
     <nav class="crumbs"><a href="#/levels">Levels</a> / <a href="#/level/${L.n}">${L.code}</a> / Unit ${idx + 1}</nav>
-    <section class="unit-head" style="--lc:${L.color}">
-      ${levelBadge(L.n)}
-      <div><h1>${esc(u.title)}</h1><p class="muted">${esc(u.topic)} · ${esc(u.grammar.title)}</p></div>
+    <section class="unit-head">
+      <p class="kicker">${L.code} &middot; Unit ${idx + 1} &middot; ${esc(u.topic)}</p>
+      <h1 class="display">${esc(u.title)}</h1>
     </section>
-    <div class="tabs" role="tablist">${TABS.map(([k, label]) => `<button role="tab" class="tab${k === tab ? " active" : ""}" data-tab="${k}">${label}</button>`).join("")}</div>
+    <nav class="tabs" role="tablist">${TABS.map(([k, label], i) => `<button role="tab" class="tab${k === tab ? " active" : ""}" data-tab="${k}"><span>${pad(i + 1)}</span>${label}</button>`).join("")}</nav>
     <section id="tab-body" class="tab-body"></section>
     <div class="pager">
-      ${idx > 0 ? `<a class="btn btn-ghost" href="#/unit/${siblings[idx - 1].id}">← Previous unit</a>` : `<a class="btn btn-ghost" href="#/level/${L.n}">← ${L.code} overview</a>`}
-      ${idx < siblings.length - 1 ? `<a class="btn btn-ghost" href="#/unit/${siblings[idx + 1].id}">Next unit →</a>` : `<a class="btn btn-ghost" href="#/level/${L.n}/test">${L.code} level test →</a>`}
+      ${idx > 0 ? `<a href="#/unit/${siblings[idx - 1].id}">&larr; ${esc(siblings[idx - 1].title)}</a>` : `<a href="#/level/${L.n}">&larr; ${L.code} overview</a>`}
+      ${idx < siblings.length - 1 ? `<a href="#/unit/${siblings[idx + 1].id}">${esc(siblings[idx + 1].title)} &rarr;</a>` : `<a href="#/level/${L.n}/test">${L.code} level test &rarr;</a>`}
     </div>`;
 
     const body = $("#tab-body");
     const show = (k) => {
-      tab = k;
       $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === k));
       history.replaceState(null, "", `#/unit/${u.id}?tab=${k}`);
       if (hasTTS) speechSynthesis.cancel();
+      body.onclick = null;
       ({ learn: renderLearn, vocab: renderVocab, reading: renderReading, practice: renderPractice, speaking: renderSpeaking })[k](body, u, show);
     };
     $$(".tab").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
     show(tab);
   }
 
+  function nextBtn(label, id) { return `<div class="next-row"><button class="btn" id="${id}">${label} &rarr;</button></div>`; }
+
   function renderLearn(el, u, show) {
     el.innerHTML = `
-    <div class="grid-side">
-      <div class="card">
+    <div class="cols cols-wide">
+      <article class="prose">
         <h2>${esc(u.grammar.title)}</h2>
         <div class="grammar">${u.grammar.html}</div>
         <h3>Examples</h3>
-        <ul class="examples">${u.grammar.examples.map((e) => `<li><button class="icon-btn" data-speak="${esc(e)}" aria-label="Listen">🔊</button>${esc(e)}</li>`).join("")}</ul>
-      </div>
-      <aside class="card">
-        <h3>In this unit you will</h3>
-        <ul class="checks">${u.objectives.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>
-        <h3>Study route</h3>
-        <ol class="route"><li>Read the lesson</li><li>Learn the vocabulary</li><li>Read the text</li><li>Practise (${PASS_PCT}% to complete)</li><li>Speak</li></ol>
-        <button class="btn btn-primary btn-block" id="go-vocab">Next: Vocabulary →</button>
+        <ul class="examples">${u.grammar.examples.map((e) => `<li>${sayBtn(e)}<span>${esc(e)}</span></li>`).join("")}</ul>
+      </article>
+      <aside class="side">
+        <h3 class="h-small">Objectives</h3>
+        <ul class="list-check">${u.objectives.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>
+        <h3 class="h-small">Route</h3>
+        <ol class="list-num small"><li>Lesson</li><li>Vocabulary</li><li>Reading</li><li>Practice (${PASS_PCT}% to complete)</li><li>Speaking</li></ol>
       </aside>
-    </div>`;
-    $("#go-vocab").onclick = () => show("vocab");
+    </div>
+    ${nextBtn("Vocabulary", "go-next")}`;
+    $("#go-next").onclick = () => show("vocab");
   }
 
   function renderVocab(el, u, show) {
     el.innerHTML = `
-    <p class="muted">Click a card to flip it. Use 🔊 to hear the word and example.</p>
-    <div class="vocab-grid">
-      ${u.vocab.map(([w, d, ex]) => `
-        <div class="flip" tabindex="0">
-          <div class="flip-inner">
-            <div class="flip-front card"><span class="word">${esc(w)}</span><button class="icon-btn" data-speak="${esc(w)}" aria-label="Listen">🔊</button></div>
-            <div class="flip-back card"><b>${esc(w)}</b><p>${esc(d)}</p><p class="ex">“${esc(ex)}” <button class="icon-btn" data-speak="${esc(ex)}" aria-label="Listen">🔊</button></p></div>
+    <p class="muted">Try to recall each meaning before you reveal it.</p>
+    <div class="vocab">
+      ${u.vocab.map(([w, d, ex], i) => `
+        <div class="vocab-row">
+          <span class="vocab-n">${pad(i + 1)}</span>
+          <div class="vocab-word">${sayBtn(w)}<b>${esc(w)}</b></div>
+          <div class="vocab-def" data-hidden="true">
+            <button class="btn-text reveal">Reveal meaning</button>
+            <div class="vocab-body"><p>${esc(d)}</p><p class="vocab-ex">${sayBtn(ex)}<i>${esc(ex)}</i></p></div>
           </div>
         </div>`).join("")}
     </div>
-    <div class="center"><button class="btn btn-primary" id="go-read">Next: Reading →</button></div>`;
-    $$(".flip").forEach((f) => {
-      const toggle = (e) => { if (e.target.closest("[data-speak]")) return; f.classList.toggle("flipped"); };
-      f.onclick = toggle;
-      f.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); f.classList.toggle("flipped"); } };
-    });
-    $("#go-read").onclick = () => show("reading");
+    <div class="next-row"><button class="btn btn-line" id="reveal-all">Reveal all</button> <button class="btn" id="go-next">Reading &rarr;</button></div>`;
+    $$(".reveal", el).forEach((b) => (b.onclick = () => (b.parentElement.dataset.hidden = "false")));
+    $("#reveal-all").onclick = () => $$(".vocab-def", el).forEach((d) => (d.dataset.hidden = "false"));
+    $("#go-next").onclick = () => show("reading");
   }
 
   function renderReading(el, u, show) {
-    const words = u.vocab.map((v) => v[0]);
     let html = esc(u.reading.text);
-    words.forEach((w) => {
+    u.vocab.map((v) => v[0]).forEach((w) => {
       const re = new RegExp(`\\b(${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "i");
-      html = html.replace(re, `<mark title="Key word">$1</mark>`);
+      html = html.replace(re, `<mark>$1</mark>`);
     });
     el.innerHTML = `
-    <div class="card reading">
-      <div class="reading-top"><h2>${esc(u.reading.title)}</h2>
-        ${hasTTS ? `<div><button class="btn btn-audio btn-sm" data-speak="${esc(u.reading.text)}">▶ Read aloud</button> <button class="btn btn-ghost btn-sm" data-speak="${esc(u.reading.text)}" data-rate="0.75">Slow</button></div>` : ""}</div>
+    <article class="reading">
+      <h2>${esc(u.reading.title)}</h2>
+      ${hasTTS ? `<div class="audio"><button class="btn btn-sm" data-speak="${esc(u.reading.text)}">${ICON_PLAY} Read aloud</button><button class="btn btn-sm btn-line" data-speak="${esc(u.reading.text)}" data-rate="0.75">Slower</button></div>` : ""}
       <p class="reading-text">${html}</p>
-      <p class="small muted">Highlighted words are from this unit's vocabulary. Read once for the general idea, then again for detail. The practice section has questions on this text.</p>
-    </div>
-    <div class="center"><button class="btn btn-primary" id="go-prac">Next: Practice →</button></div>`;
-    $("#go-prac").onclick = () => show("practice");
+      <p class="muted small">Underlined words are from this unit's vocabulary. Read it once for the general idea, then again for detail.</p>
+    </article>
+    ${nextBtn("Practice", "go-next")}`;
+    $("#go-next").onclick = () => show("practice");
   }
 
   function renderPractice(el, u, show) {
     const s = state.units[u.id];
-    el.innerHTML = `${s ? `<p class="muted">Best score: <b>${s.best}%</b>${s.done ? " · ✓ Completed" : ` · Score ${PASS_PCT}% to complete this unit`}</p>` : `<p class="muted">Score ${PASS_PCT}% or more to complete this unit.</p>`}<div id="ex-host"></div>`;
-    mountExercises($("#ex-host"), u.ex, (score) => {
+    el.innerHTML = `
+      <div class="practice-head">
+        <p class="muted">${s ? `Best score <b>${s.best}%</b>${s.done ? " &middot; unit complete" : ` &middot; ${PASS_PCT}% completes the unit`}` : `Score ${PASS_PCT}% or more to complete the unit.`}</p>
+        <button class="btn btn-sm btn-line" id="fresh">New practice set</button>
+      </div>
+      <div id="ex-host"></div>`;
+    const scoreMsg = (score) => {
       const prev = state.units[u.id] || { best: 0, done: false };
       state.units[u.id] = { best: Math.max(prev.best, score), done: prev.done || score >= PASS_PCT, last: new Date().toISOString() };
       save();
       return score >= PASS_PCT
-        ? `<b>Great work — unit completed!</b> <button class="btn btn-sm btn-primary" id="go-speak">Next: Speaking →</button>`
-        : `Keep going — you need ${PASS_PCT}% to complete the unit. Review the <a href="#/unit/${u.id}?tab=learn">lesson</a> and try again.`;
-    }, () => renderPractice(el, u, show));
+        ? `<b>Unit complete.</b> <button class="btn-text" id="go-speak">Go to speaking &rarr;</button>`
+        : `You need ${PASS_PCT}% to complete the unit. Review the lesson, then try a new set.`;
+    };
+    mountExercises($("#ex-host", el), u.ex, scoreMsg, () => renderPractice(el, u, show));
+    $("#fresh", el).onclick = () => {
+      const topics = GEN.UNIT_TOPICS[u.id];
+      const local = new Set(seen);
+      const set = [];
+      for (let i = 0; i < 6; i++) set.push(GEN.generate({ lvl: u.level, topics }, local));
+      for (let i = 0; i < 4; i++) set.push(GEN.generate({ lvl: u.level }, local));
+      set.forEach((q) => seen.add(GEN.keyOf(q)));
+      $(".practice-head p", el).innerHTML = `New practice set: 10 questions on <b>${esc(u.grammar.title)}</b> and other ${lvl(u.level).code} material.`;
+      mountExercises($("#ex-host", el), set.map(toEx), scoreMsg, () => $("#fresh", el).click());
+      el.scrollIntoView({ behavior: "smooth" });
+    };
     el.onclick = (e) => { if (e.target.id === "go-speak") show("speaking"); };
   }
 
   function renderSpeaking(el, u) {
     el.innerHTML = `
-    <div class="card">
-      <h2>Speaking practice</h2>
-      <p class="muted">Listen to each sentence, then say it aloud. ${SR ? "Press <b>🎙 Speak</b> and we'll check how closely you matched it." : "Speech recognition isn't available in this browser (try Chrome or Edge) — listen and repeat, then compare yourself."}</p>
-      <div class="speak-list">
-        ${u.speaking.map((s, i) => `
-          <div class="speak-row" data-i="${i}">
-            <p class="speak-text">${esc(s)}</p>
-            <div class="speak-actions">
-              <button class="btn btn-ghost btn-sm" data-speak="${esc(s)}">🔊 Listen</button>
-              ${SR ? `<button class="btn btn-primary btn-sm rec">🎙 Speak</button>` : ""}
-            </div>
-            <div class="speak-result small"></div>
-          </div>`).join("")}
-      </div>
+    <p class="muted">Listen to each sentence, then say it aloud. ${SR ? "Press <b>Speak</b> and we'll check how closely you matched it." : "Speech recognition isn't available in this browser (try Chrome or Edge), so listen, repeat, and compare yourself."}</p>
+    <div class="speak-list">
+      ${u.speaking.map((s, i) => `
+        <div class="speak-row" data-i="${i}">
+          <span class="vocab-n">${pad(i + 1)}</span>
+          <p class="speak-text">${esc(s)}</p>
+          <div class="speak-actions">
+            <button class="btn btn-sm btn-line" data-speak="${esc(s)}">${ICON_PLAY} Listen</button>
+            ${SR ? `<button class="btn btn-sm rec">${ICON_MIC} Speak</button>` : ""}
+          </div>
+          <div class="speak-result small"></div>
+        </div>`).join("")}
     </div>
-    <div class="card section"><h3>Speaking challenge</h3><p>Record yourself for 60 seconds answering: <b>${esc(speakingPrompt(u))}</b> Try to use the grammar and vocabulary from this unit.</p></div>`;
+    <div class="boxed"><h3>Speaking task</h3><p>Talk for 60 seconds about this: <b>${esc(speakingPrompt(u))}</b> Try to use this unit's grammar and vocabulary. Record yourself and listen back.</p></div>`;
     if (!SR) return;
-    $$(".speak-row").forEach((row) => {
+    $$(".speak-row", el).forEach((row) => {
       const target = u.speaking[+row.dataset.i];
       const btn = $(".rec", row);
       const out = $(".speak-result", row);
@@ -594,14 +719,14 @@
         let rec;
         try { rec = new SR(); } catch (e) { out.textContent = "Couldn't start the microphone."; return; }
         rec.lang = "en-GB"; rec.interimResults = false; rec.maxAlternatives = 1;
-        btn.disabled = true; btn.textContent = "Listening…"; out.textContent = "";
+        btn.disabled = true; btn.lastChild.textContent = " Listening…"; out.textContent = "";
         rec.onresult = (ev) => {
           const heard = ev.results[0][0].transcript;
           const pct = similarity(target, heard);
-          out.innerHTML = `You said: “${esc(heard)}” — <b class="${pct >= 80 ? "ok" : pct >= 50 ? "mid" : "bad"}">${pct}% match</b> ${pct >= 80 ? "Excellent!" : pct >= 50 ? "Good — try once more." : "Listen again and repeat slowly."}`;
+          out.innerHTML = `Heard: “${esc(heard)}” &middot; <b class="${pct >= 80 ? "t-ok" : pct >= 50 ? "t-mid" : "t-bad"}">${pct}% match</b>. ${pct >= 80 ? "Excellent." : pct >= 50 ? "Close. Try once more." : "Listen again and repeat it slowly."}`;
         };
-        rec.onerror = (ev) => { out.textContent = ev.error === "not-allowed" ? "Microphone permission was denied." : "Didn't catch that — try again."; };
-        rec.onend = () => { btn.disabled = false; btn.textContent = "🎙 Speak"; };
+        rec.onerror = (ev) => { out.textContent = ev.error === "not-allowed" ? "Microphone permission was denied." : "Didn't catch that. Try again."; };
+        rec.onend = () => { btn.disabled = false; btn.lastChild.textContent = " Speak"; };
         rec.start();
       };
     });
@@ -614,12 +739,12 @@
       "a2-2": "Describe your plans for your next holiday and compare two places.",
       "b1-1": "Talk about the most interesting experience you have had.",
       "b1-2": "What will you do if you get your dream job?",
-      "b2-1": "Describe a decision you regret, or one you are glad you made.",
+      "b2-1": "Describe a decision you regret, or one you're glad you made.",
       "b2-2": "Report a conversation you had recently.",
-      "c1-1": "Describe something that truly surprised you, using inversion for emphasis.",
+      "c1-1": "Describe something that really surprised you, using inversion for emphasis.",
       "c1-2": "Give a cautious, hedged opinion on whether social media harms society.",
       "c2-1": "Make a formal recommendation to your company's board.",
-      "c2-2": "Give a short persuasive speech using at least two rhetorical devices."
+      "c2-2": "Give a short persuasive speech that uses at least two rhetorical devices."
     }[u.id] || "Talk about the topic of this unit.";
   }
   function similarity(target, heard) {
@@ -637,8 +762,8 @@
     const resp = list.map(() => null);
     const orders = {};
     host.innerHTML = `
-      <div class="ex-list">${list.map((ex, i) => exHTML(ex, i)).join("")}</div>
-      <div class="ex-footer card"><button class="btn btn-primary btn-lg" id="check">Check answers</button><div id="ex-score"></div></div>`;
+      <ol class="ex-list">${list.map((ex, i) => exHTML(ex, i)).join("")}</ol>
+      <div class="ex-footer"><button class="btn btn-lg" id="check">Check answers</button><div id="ex-score"></div></div>`;
 
     list.forEach((ex, i) => {
       const box = $(`.ex[data-i="${i}"]`, host);
@@ -662,7 +787,7 @@
     function renderOrder(box, i) {
       const st = orders[i];
       const graded = box.classList.contains("graded");
-      $(".built", box).innerHTML = st.built.length ? st.built.map((t, j) => `<button class="tile" data-from="built" data-j="${j}">${esc(t.w)}</button>`).join("") : `<span class="muted small">Click the words below in the correct order</span>`;
+      $(".built", box).innerHTML = st.built.length ? st.built.map((t, j) => `<button class="tile" data-from="built" data-j="${j}">${esc(t.w)}</button>`).join("") : `<span class="muted small">Click the words below in order</span>`;
       $(".pool", box).innerHTML = st.pool.map((t, j) => `<button class="tile" data-from="pool" data-j="${j}">${esc(t.w)}</button>`).join("");
       $$(".tile", box).forEach((b) => (b.onclick = () => {
         if (graded) return;
@@ -695,16 +820,16 @@
         if (ok) correct++;
         box.classList.add(ok ? "is-right" : "is-wrong");
         $(".fb", box).innerHTML = ok
-          ? `<span class="ok">✓ Correct.</span> ${ex.x ? esc(ex.x) : ""}`
-          : `<span class="bad">✗ Answer: <b>${esc(answerText)}</b>.</span> ${ex.x ? esc(ex.x) : ""}`;
-        if (ex.t === "listen" && ex.audio) $(".fb", box).innerHTML += `<div class="transcript small muted">Transcript: “${esc(ex.audio)}”</div>`;
+          ? `<b class="t-ok">Correct.</b> ${ex.x ? esc(ex.x) : ""}`
+          : `<b class="t-bad">Answer: ${esc(answerText)}.</b> ${ex.x ? esc(ex.x) : ""}`;
+        if (ex.t === "listen" && ex.audio) $(".fb", box).innerHTML += `<div class="muted small">Transcript: “${esc(ex.audio)}”</div>`;
       });
       const pct = Math.round((correct / list.length) * 100);
       const msg = onScore(pct, correct, list.length);
       $("#check", host).remove();
       $("#ex-score", host).innerHTML = `
-        <div class="score-ring" style="--p:${pct}"><span>${pct}%</span></div>
-        <div><p><b>${correct} / ${list.length} correct</b></p><p>${msg}</p><button class="btn btn-ghost btn-sm" id="retry">Try again</button></div>`;
+        <div class="score"><span class="score-n">${pct}<small>%</small></span><span class="muted">${correct} of ${list.length} correct</span></div>
+        <div class="score-msg"><p>${msg}</p><button class="btn btn-sm btn-line" id="retry">Try again</button></div>`;
       $("#retry", host).onclick = onRetry;
       $("#ex-score", host).scrollIntoView({ behavior: "smooth", block: "center" });
     };
@@ -716,36 +841,44 @@
     if (ex.passage) body += `<div class="passage">${esc(ex.passage)}</div>`;
     if (ex.t === "listen") body += audioBox(ex.audio) + (hasTTS ? "" : `<div class="passage">${esc(ex.audio)}</div>`);
     if (ex.t === "mc" || ex.t === "listen") {
-      body += `<p class="ex-q">${esc(ex.q)}</p><div class="options compact">${ex.o.map((o, k) => `<button class="opt" data-o="${k}"><span class="opt-key">${"ABCD"[k]}</span><span>${esc(o)}</span></button>`).join("")}</div>`;
+      body += `<p class="ex-q">${esc(ex.q)}</p><div class="options compact">${ex.o.map((o, k) => `<button class="opt" data-o="${k}"><span class="key">${"ABCD"[k]}</span><span>${esc(o)}</span></button>`).join("")}</div>`;
     } else if (ex.t === "fill") {
       const [a, b] = ex.q.split("___");
       body += `<p class="ex-q fill-q">${esc(a)}<input type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Your answer">${esc(b || "")}</p>`;
     } else if (ex.t === "order") {
-      body += `<div class="built"></div><div class="pool"></div>${ex.p ? `<p class="small muted">Sentence ends with “${esc(ex.p)}”</p>` : ""}`;
+      body += `<div class="built"></div><div class="pool"></div>${ex.p ? `<p class="small muted">The sentence ends with “${esc(ex.p)}”</p>` : ""}`;
     }
-    return `<div class="card ex" data-i="${i}"><div class="ex-head"><span class="ex-n">${i + 1}</span><span class="small muted">${label}</span></div>${body}<div class="fb"></div></div>`;
+    return `<li class="ex" data-i="${i}"><div class="ex-head"><span class="ex-n">${pad(i + 1)}</span><span class="ex-label">${label}${ex.skill ? " &middot; " + skill(ex.skill).name : ""}</span></div>${body}<div class="fb"></div></li>`;
   }
 
   /* =========================================================
-     LEVEL TEST
+     LEVEL TEST (generated fresh every attempt)
      ========================================================= */
   function levelTest(n) {
     const L = lvl(n);
-    const qs = shuffle(TEST_BANK.filter((q) => q.lvl === n)).map((q) => ({ t: q.audio ? "listen" : "mc", q: q.q, o: q.o, a: q.a, audio: q.audio, passage: q.passage }));
+    const local = new Set(seen);
+    const qs = [];
+    SKILL_IDS.forEach((s) => { for (let i = 0; i < LEVEL_TEST_PER_SKILL; i++) qs.push(GEN.generate({ lvl: n, skill: s }, local)); });
+    qs.forEach((q) => seen.add(GEN.keyOf(q)));
+    const list = shuffle(qs).map(toEx);
     app.innerHTML = `
     <nav class="crumbs"><a href="#/levels">Levels</a> / <a href="#/level/${n}">${L.code}</a> / Level test</nav>
-    <section class="unit-head" style="--lc:${L.color}">${levelBadge(n)}<div><h1>${L.code} level test</h1><p class="muted">${qs.length} questions · pass mark ${PASS_PCT}%</p></div></section>
+    <section class="unit-head">
+      <p class="kicker">${L.code} level test</p>
+      <h1 class="display">${L.name} level test</h1>
+      <p class="muted">${list.length} questions &middot; pass mark ${PASS_PCT}% &middot; new questions every attempt</p>
+    </section>
     <div id="lt-host"></div>`;
-    mountExercises($("#lt-host"), qs, (pct) => {
+    mountExercises($("#lt-host"), list, (pct) => {
       const passed = pct >= PASS_PCT;
       let moved = false;
       if (passed && n < 6 && (state.level == null || state.level <= n)) { state.level = n + 1; moved = true; }
       if (state.level == null) state.level = n;
       state.history.unshift({ type: "level", date: new Date().toISOString(), level: n, score: pct, passed });
       save();
-      if (!passed) return `Not quite — you need ${PASS_PCT}%. Review the <a href="#/level/${n}">${L.code} units</a> and try again.`;
-      if (moved) return `🎉 <b>Congratulations! You've unlocked ${lvl(n + 1).code} ${lvl(n + 1).name}.</b> <a class="btn btn-sm btn-primary" href="#/level/${n + 1}">Go to ${lvl(n + 1).code}</a>`;
-      return n === 6 ? `🏆 <b>C2 mastery confirmed.</b> Outstanding!` : `<b>Passed!</b> You've already reached a higher level.`;
+      if (!passed) return `Not this time: you need ${PASS_PCT}%. Practise at <a href="#/practice?l=${n}">${L.code}</a>, then take a new test.`;
+      if (moved) return `<b>Passed. You've unlocked ${lvl(n + 1).code} ${lvl(n + 1).name}.</b> <a href="#/level/${n + 1}">Go to ${lvl(n + 1).code} &rarr;</a>`;
+      return n === 6 ? `<b>C2 confirmed.</b>` : `<b>Passed.</b> You're already above this level.`;
     }, () => levelTest(n));
   }
 
@@ -754,70 +887,60 @@
      ========================================================= */
   function dashboard() {
     if (state.level == null) {
-      app.innerHTML = `<section class="narrow center"><h1>My progress</h1><p class="lead">You haven't taken the placement test yet. It takes about 15 minutes and tells you where to start.</p><a class="btn btn-primary btn-lg" href="#/test">Take the level test</a><p class="small muted">Or <a href="#/levels">browse levels</a> and start anywhere.</p></section>`;
+      app.innerHTML = `<section class="page-head narrow"><p class="kicker">My progress</p><h1 class="display">Nothing here yet</h1><p class="lede">Take the placement test to find out where to start. It takes about 15 minutes.</p><div class="actions"><a class="btn btn-lg" href="#/test">Take the level test</a><a class="btn btn-lg btn-line" href="#/practice">Practise without a test</a></div></section>`;
       return;
     }
     const L = lvl(state.level);
     const next = unitsOf(state.level).find((u) => !unitDone(u.id));
     const doneAll = UNITS.filter((u) => unitDone(u.id)).length;
     const p = state.placement;
+    const pr = state.practice;
 
     app.innerHTML = `
-    <section>
-      <span class="eyebrow">My progress</span>
-      <h1>Welcome back</h1>
+    <section class="page-head">
+      <p class="kicker">My progress</p>
+      <h1 class="display">You're at <em>${L.code}</em>, ${L.name.toLowerCase()}.</h1>
     </section>
-    <section class="grid-3 section">
-      <div class="card stat" style="--lc:${L.color}">${levelBadge(state.level, true)}<div><span class="muted small">Current level</span><h3>${L.name}</h3></div></div>
-      <div class="card stat"><div class="stat-n">${doneAll}<span class="muted">/${UNITS.length}</span></div><div><span class="muted small">Units completed</span><h3>across all levels</h3></div></div>
-      <div class="card stat"><div class="stat-n">${levelProgress(state.level)}%</div><div><span class="muted small">${L.code} progress</span><h3>${unitsOf(state.level).filter((u) => unitDone(u.id)).length} of ${unitsOf(state.level).length} units</h3></div></div>
+    ${ruler(state.level)}
+    <section class="stats-line band">
+      <div><span>Units complete</span><b>${doneAll}<small>/${UNITS.length}</small></b></div>
+      <div><span>${L.code} progress</span><b>${levelProgress(state.level)}<small>%</small></b></div>
+      <div><span>Practice answered</span><b>${pr.answered}</b></div>
+      <div><span>Practice accuracy</span><b>${pr.answered ? Math.round((pr.correct / pr.answered) * 100) + "<small>%</small>" : "—"}</b></div>
+      <div><span>Best streak</span><b>${pr.best}</b></div>
     </section>
 
-    <section class="card section next-up">
+    <section class="next-up">
       <div>
-        <span class="eyebrow">Recommended next</span>
+        <p class="kicker">Up next</p>
         ${next
-          ? `<h2>${L.code} · ${esc(next.title)}</h2><p class="muted">${esc(next.grammar.title)}</p>`
-          : `<h2>${state.level < 6 ? `Take the ${L.code} level test` : "C2 mastery check"}</h2><p class="muted">You've completed every unit at this level.</p>`}
+          ? `<h2>${esc(next.title)}</h2><p class="muted">${L.code} &middot; ${esc(next.grammar.title)}</p>`
+          : `<h2>${state.level < 6 ? `${L.code} level test` : "C2 mastery check"}</h2><p class="muted">You've completed every unit at this level.</p>`}
       </div>
-      <a class="btn btn-primary btn-lg" href="${next ? `#/unit/${next.id}` : `#/level/${state.level}/test`}">${next ? "Continue" : "Start test"}</a>
+      <div class="actions"><a class="btn btn-lg" href="${next ? `#/unit/${next.id}` : `#/level/${state.level}/test`}">${next ? "Continue" : "Start test"}</a><a class="btn btn-lg btn-line" href="#/practice?l=${state.level}">Practise</a></div>
     </section>
 
-    <section class="grid-2 section">
-      <div class="card">
-        <h2>Level map</h2>
-        <div class="bars">
-          ${LEVELS.map((x) => `
-            <div class="bar-row">
-              <div class="bar-label"><span>${x.code} ${x.name}${x.n === state.level ? " · <b>current</b>" : ""}</span><span class="muted">${levelProgress(x.n)}%</span></div>
-              <div class="bar"><div class="bar-fill" style="width:${Math.max(levelProgress(x.n), 0)}%;background:${x.color}"></div></div>
-            </div>`).join("")}
-        </div>
+    <section class="cols band">
+      <div>
+        <h2 class="h-section">Placement skills</h2>
+        ${p ? `${skillBars(skillRowsOf(p))}<p class="small"><a href="#/results">Full results and study plan &rarr;</a></p>` : `<p class="muted">Take the <a href="#/test">placement test</a> to see your skill profile.</p>`}
       </div>
-      <div class="card">
-        <h2>Placement skills</h2>
-        ${p ? `<div class="bars">${SKILLS.filter((s) => p.skills[s.id] != null).map((s) => {
-          const v = p.skills[s.id];
-          return `<div class="bar-row"><div class="bar-label"><span>${s.name}</span><span class="muted">${lvl(Math.floor(v)).code}</span></div><div class="bar"><div class="bar-fill skill-bg-${s.id}" style="width:${Math.max(4, ((v - 1) / 5.99) * 100)}%"></div></div></div>`;
-        }).join("")}</div><p class="small"><a href="#/results">View full results & study plan →</a></p>` : `<p class="muted">Take the <a href="#/test">placement test</a> to see your skill profile.</p>`}
+      <div>
+        <h2 class="h-section">Test history</h2>
+        ${state.history.length ? `<table class="table"><thead><tr><th>Date</th><th>Test</th><th>Result</th></tr></thead><tbody>
+          ${state.history.slice(0, 10).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement" : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} &middot; ${h.correct}/${h.total}` : `${h.score}% ${h.passed ? "pass" : "fail"}`}</td></tr>`).join("")}
+        </tbody></table>` : `<p class="muted">No tests yet.</p>`}
       </div>
     </section>
 
-    <section class="card section">
-      <h2>Test history</h2>
-      ${state.history.length ? `<table class="table"><thead><tr><th>Date</th><th>Test</th><th>Result</th></tr></thead><tbody>
-        ${state.history.slice(0, 12).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement test" : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} (${h.band}) · ${h.correct}/${h.total}` : `${h.score}% ${h.passed ? "✅" : "❌"}`}</td></tr>`).join("")}
-      </tbody></table>` : `<p class="muted">No tests yet.</p>`}
-    </section>
-
-    <section class="section danger-zone">
-      <button class="btn btn-link" id="reset">Reset all progress</button>
-      <span id="reset-confirm" hidden> Are you sure? <button class="btn btn-sm btn-danger" id="reset-yes">Yes, reset</button> <button class="btn btn-sm btn-ghost" id="reset-no">Cancel</button></span>
+    <section class="danger">
+      <button class="btn-text" id="reset">Reset all progress</button>
+      <span id="reset-confirm" hidden>This deletes your level, scores and history. <button class="btn btn-sm btn-danger" id="reset-yes">Reset</button> <button class="btn btn-sm btn-line" id="reset-no">Cancel</button></span>
     </section>`;
 
     $("#reset").onclick = () => ($("#reset-confirm").hidden = false);
     $("#reset-no").onclick = () => ($("#reset-confirm").hidden = true);
-    $("#reset-yes").onclick = () => { state = defaultState(); save(); location.hash = "#/"; };
+    $("#reset-yes").onclick = () => { state = defaultState(); seen = new Set(); save(); location.hash = "#/"; };
   }
 
   /* ---------- boot ---------- */

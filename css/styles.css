@@ -371,3 +371,4 @@ mark { background: none; color: inherit; text-decoration: underline; text-decora
 .table th { font-family: var(--mono); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); font-weight: 500; }
 .danger { margin-top: 56px; text-align: right; font-size: .9rem; color: var(--ink-2); }
 .h-section + .table-list, .h-section + .steps, .h-section + .plan, .h-section + .list-check, .h-section + .table { border-top: 0; }
+.audio-fallback { flex-basis: 100%; margin: 6px 0 0; font-size: .9rem; color: var(--ink-2); border-left: 3px solid var(--accent); padding-left: 10px; }

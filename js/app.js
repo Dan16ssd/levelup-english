@@ -54,25 +54,66 @@
   }
 
   /* ---------- speech ---------- */
-  const hasTTS = "speechSynthesis" in window;
+  /* Notes for Safari / iOS, which is strict about speech:
+     - the first utterance must start inside a tap/click, so we "unlock" speech on the first interaction;
+     - speak() right after cancel() is silently dropped, so we wait a moment after cancelling;
+     - utterances can be garbage-collected mid-sentence unless we keep a reference;
+     - some listed voices aren't installed, so we prefer local/default voices and fall back to lang only. */
+  const hasTTS = "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
   let voice = null;
+  let unlocked = false;
+  let current = null;
   function pickVoice() {
-    const vs = speechSynthesis.getVoices();
-    voice = vs.find((v) => /en[-_]GB/i.test(v.lang)) || vs.find((v) => /en[-_]US/i.test(v.lang)) || vs.find((v) => /^en/i.test(v.lang)) || null;
+    const vs = speechSynthesis.getVoices().filter((v) => /^en[-_]/i.test(v.lang));
+    const local = vs.filter((v) => v.localService !== false);
+    const pool = local.length ? local : vs;
+    voice = pool.find((v) => /en[-_]GB/i.test(v.lang) && v.default) || pool.find((v) => /en[-_]GB/i.test(v.lang)) ||
+      pool.find((v) => v.default) || pool.find((v) => /en[-_]US/i.test(v.lang)) || pool[0] || null;
   }
-  if (hasTTS) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
-  function speak(text, rate) {
+  if (hasTTS) {
+    pickVoice();
+    if (typeof speechSynthesis.addEventListener === "function") speechSynthesis.addEventListener("voiceschanged", pickVoice);
+    else speechSynthesis.onvoiceschanged = pickVoice;
+  }
+  function unlockSpeech() {
+    if (unlocked || !hasTTS) return;
+    unlocked = true;
+    try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch (e) { /* ignore */ }
+  }
+  function stopSpeech() {
+    if (hasTTS && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
+    current = null;
+  }
+  function showTranscript(box) {
+    const b = box || $(".audio");
+    const t = b && $(".audio-fallback", b);
+    if (t) t.hidden = false;
+  }
+  function speak(text, rate, box) {
     if (!hasTTS) return;
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    if (voice) { u.voice = voice; u.lang = voice.lang; } else { u.lang = "en-GB"; }
-    u.rate = rate || 0.95;
-    speechSynthesis.speak(u);
+    if (!voice) pickVoice();
+    const go = () => {
+      const u = new SpeechSynthesisUtterance(text);
+      if (voice) u.voice = voice;
+      u.lang = voice ? voice.lang : "en-GB";
+      u.rate = rate || 0.95;
+      let started = false;
+      u.onstart = () => { started = true; };
+      u.onend = () => { if (current === u) current = null; };
+      u.onerror = (e) => { if (e.error !== "interrupted" && e.error !== "canceled") showTranscript(box); };
+      current = u; // keep a reference so Safari doesn't drop it mid-sentence
+      speechSynthesis.speak(u);
+      if (speechSynthesis.paused) speechSynthesis.resume();
+      setTimeout(() => { if (!started && current === u) showTranscript(box); }, 3000);
+    };
+    if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); setTimeout(go, 80); } else go();
   }
   document.addEventListener("click", (e) => {
     const b = e.target.closest("[data-speak]");
-    if (b) { e.preventDefault(); speak(b.getAttribute("data-speak"), parseFloat(b.getAttribute("data-rate")) || 0.95); }
-  });
+    if (b) { e.preventDefault(); unlocked = true; speak(b.getAttribute("data-speak"), parseFloat(b.getAttribute("data-rate")) || 0.95, b.closest(".audio")); }
+    else unlockSpeech();
+  }, true);
+  document.addEventListener("touchend", () => unlockSpeech(), { passive: true });
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   const sayBtn = (text, label) => `<button class="say" data-speak="${esc(text)}" aria-label="Listen">${ICON_SPEAKER}${label ? `<span>${label}</span>` : ""}</button>`;
 
@@ -81,7 +122,8 @@
     return `<div class="audio">
       <button class="btn btn-sm" data-speak="${esc(text)}">${ICON_PLAY} Play recording</button>
       <button class="btn btn-sm btn-line" data-speak="${esc(text)}" data-rate="0.7">Slower</button>
-      <span class="audio-note">Replay as often as you need.</span></div>`;
+      <span class="audio-note">Replay as often as you need.</span>
+      <p class="audio-fallback" hidden>No sound? Check your volume, and on iPhone make sure silent mode is off. Transcript: “${esc(text)}”</p></div>`;
   }
 
   /* ---------- router ---------- */
@@ -100,7 +142,7 @@
   function router() {
     const raw = location.hash.replace(/^#/, "") || "/";
     const [path, query] = raw.split("?");
-    if (hasTTS) speechSynthesis.cancel();
+    stopSpeech();
     document.onkeydown = null;
     for (const [re, fn] of routes) {
       const m = path.match(re);
@@ -269,7 +311,7 @@
       if (k in map && map[k] < q.o.length) select(map[k]);
       else if (k === "enter" && selected != null) answer(selected);
     };
-    if (q.audio && hasTTS) setTimeout(() => speak(q.audio), 350);
+    if (q.audio && hasTTS) speak(q.audio);
   }
 
   /* Ability estimate: each answer contributes level+0.5 if right, level-0.5 if wrong.
@@ -482,7 +524,7 @@
         if (k in map && map[k] < q.o.length) choose(map[k]);
         else if (k === "enter") { e.preventDefault(); check(); }
       };
-      if (q.audio && hasTTS) setTimeout(() => speak(q.audio), 300);
+      if (q.audio && hasTTS) speak(q.audio);
     }
 
     $$(".seg [data-l]").forEach((b) => (b.onclick = () => { L = +b.dataset.l; $$(".seg [data-l]").forEach((x) => x.classList.toggle("on", x === b)); setParams(); nextQ(); }));
@@ -596,7 +638,7 @@
     const show = (k) => {
       $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === k));
       history.replaceState(null, "", `#/unit/${u.id}?tab=${k}`);
-      if (hasTTS) speechSynthesis.cancel();
+      stopSpeech();
       body.onclick = null;
       ({ learn: renderLearn, vocab: renderVocab, reading: renderReading, practice: renderPractice, speaking: renderSpeaking })[k](body, u, show);
     };

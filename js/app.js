@@ -10,11 +10,21 @@
   const SKILL_IDS = SKILLS.map((s) => s.id);
 
   /* ---------- state ---------- */
-  const defaultState = () => ({ level: null, placement: null, units: {}, history: [], seen: [], practice: { answered: 0, correct: 0, best: 0 } });
+  const DAILY_GOAL = 20;
+  const SRS_DAYS = [0, 1, 2, 4, 8, 16, 32, 64];
+  const defaultState = () => ({
+    level: null, placement: null, units: {}, history: [], seen: [], practice: { answered: 0, correct: 0, best: 0 },
+    days: {}, srs: {}, writing: {}, name: "", settings: { voice: "", rate: 1 }
+  });
   function load() {
     try {
       const s = JSON.parse(localStorage.getItem(KEY));
-      return s ? Object.assign(defaultState(), s) : defaultState();
+      if (!s) return defaultState();
+      const d = defaultState();
+      const out = Object.assign(d, s);
+      out.settings = Object.assign(defaultState().settings, s.settings || {});
+      out.practice = Object.assign(defaultState().practice, s.practice || {});
+      return out;
     } catch (e) { return defaultState(); }
   }
   let state = load();
@@ -38,6 +48,24 @@
   const fmtDate = (iso) => new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
   const pad = (n) => String(n).padStart(2, "0");
   const levelProgress = (n) => { const us = unitsOf(n); return Math.round((us.filter((u) => unitDone(u.id)).length / us.length) * 100); };
+  const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return dayKey(d); };
+  function logActivity(n) {
+    const k = dayKey();
+    state.days[k] = (state.days[k] || 0) + (n || 1);
+    const keys = Object.keys(state.days).sort();
+    if (keys.length > 400) keys.slice(0, keys.length - 400).forEach((x) => delete state.days[x]);
+  }
+  function dayStreak() {
+    let n = 0;
+    const d = new Date();
+    if (!state.days[dayKey(d)]) d.setDate(d.getDate() - 1);
+    while (state.days[dayKey(d)]) { n++; d.setDate(d.getDate() - 1); }
+    return n;
+  }
+  const today = () => state.days[dayKey()] || 0;
+  const b64enc = (obj) => btoa(unescape(encodeURIComponent(JSON.stringify(obj)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const b64dec = (str) => JSON.parse(decodeURIComponent(escape(atob(str.replace(/-/g, "+").replace(/_/g, "/").replace(/\s/g, "")))));
   const toEx = (q) => ({ t: q.audio ? "listen" : "mc", q: q.q, o: q.o, a: q.a, audio: q.audio, passage: q.passage, x: q.x, skill: q.skill });
 
   const ICON_PLAY = `<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>`;
@@ -63,12 +91,28 @@
   let voice = null;
   let unlocked = false;
   let current = null;
+  /* Rank voices so the natural-sounding ones win over the robotic defaults. */
+  const NOVELTY = /compact|eloquence|novelty|whisper|bells|zarvox|bad news|good news|bahh|boing|bubbles|cellos|jester|organ|superstar|trinoids|wobble|albert|fred|junior|ralph|kathy|grandma|grandpa|rocko|shelley|\bflo\b|eddy|reed|sandy/i;
+  function voiceScore(v) {
+    let s = 0;
+    const n = v.name || "";
+    if (/natural|neural|premium|enhanced|siri/i.test(n)) s += 40;
+    if (/google/i.test(n)) s += 25;
+    if (/samantha|daniel|serena|karen|moira|tessa|kate|oliver|arthur|martha|libby|sonia|ryan|aria|jenny|guy/i.test(n)) s += 15;
+    if (/en[-_]GB/i.test(v.lang)) s += 6; else if (/en[-_]US/i.test(v.lang)) s += 4;
+    if (v.localService !== false) s += 8;
+    if (v.default) s += 3;
+    if (NOVELTY.test(n)) s -= 60;
+    return s;
+  }
+  function englishVoices() {
+    if (!hasTTS) return [];
+    return speechSynthesis.getVoices().filter((v) => /^en([-_]|$)/i.test(v.lang)).sort((a, b) => voiceScore(b) - voiceScore(a));
+  }
   function pickVoice() {
-    const vs = speechSynthesis.getVoices().filter((v) => /^en[-_]/i.test(v.lang));
-    const local = vs.filter((v) => v.localService !== false);
-    const pool = local.length ? local : vs;
-    voice = pool.find((v) => /en[-_]GB/i.test(v.lang) && v.default) || pool.find((v) => /en[-_]GB/i.test(v.lang)) ||
-      pool.find((v) => v.default) || pool.find((v) => /en[-_]US/i.test(v.lang)) || pool[0] || null;
+    const vs = englishVoices();
+    const chosen = state.settings.voice && vs.find((v) => v.voiceURI === state.settings.voice);
+    voice = chosen || vs[0] || null;
   }
   if (hasTTS) {
     pickVoice();
@@ -96,7 +140,7 @@
       const u = new SpeechSynthesisUtterance(text);
       if (voice) u.voice = voice;
       u.lang = voice ? voice.lang : "en-GB";
-      u.rate = rate || 0.95;
+      u.rate = Math.min(2, Math.max(0.4, (rate || 0.95) * (state.settings.rate || 1)));
       let started = false;
       u.onstart = () => { started = true; };
       u.onend = () => { if (current === u) current = null; };
@@ -137,7 +181,11 @@
     [/^\/level\/([1-6])$/, (n) => levelPage(+n)],
     [/^\/level\/([1-6])\/test$/, (n) => levelTest(+n)],
     [/^\/unit\/([\w-]+)$/, unitPage],
-    [/^\/dashboard$/, dashboard]
+    [/^\/dashboard$/, dashboard],
+    [/^\/review$/, reviewPage],
+    [/^\/settings$/, settingsPage],
+    [/^\/certificate$/, certificatePage],
+    [/^\/cert\/([\w-]+)$/, (d) => certView(d)]
   ];
   function router() {
     const raw = location.hash.replace(/^#/, "") || "/";
@@ -299,6 +347,7 @@
       const correct = idx === q.a;
       seen.add(GEN.keyOf(q));
       T.answers.push({ lvl: q.lvl, skill: q.skill, correct });
+      logActivity(1);
       T.cur = correct ? Math.min(6, T.cur + 1) : Math.max(1, T.cur - 1);
       if (T.answers.length >= T.total) finishTest(); else { renderTestQuestion(); window.scrollTo(0, 0); }
     };
@@ -425,7 +474,7 @@
 
     <section class="band cta-line">
       <p>Your progress is saved in this browser.</p>
-      <div class="actions"><a class="btn" href="#/unit/${unitsOf(p.level)[0].id}">Start ${L.code} unit 1</a><a class="btn btn-line" href="#/test">Take a new test</a></div>
+      <div class="actions"><a class="btn" href="#/unit/${unitsOf(p.level)[0].id}">Start ${L.code} unit 1</a><a class="btn btn-line" href="#/certificate">Get your certificate</a><a class="btn btn-line" href="#/test">Take a new test</a></div>
     </section>`;
   }
 
@@ -479,7 +528,7 @@
         <div><span>Accuracy</span><b>${session.answered ? acc + "%" : "—"}</b></div>
         <div><span>Streak</span><b>${session.streak}</b></div>
         <div><span>Best streak</span><b>${state.practice.best}</b></div>
-        <div><span>All-time answered</span><b>${state.practice.answered}</b></div>`;
+        <div><span>Today</span><b>${Math.min(today(), DAILY_GOAL)}<small>/${DAILY_GOAL}</small></b></div>`;
     };
     const setParams = () => history.replaceState(null, "", `#/practice?l=${L}${S ? "&s=" + S : ""}`);
 
@@ -502,7 +551,7 @@
         if (picked == null) return;
         done = true;
         const ok = picked === q.a;
-        session.answered++; state.practice.answered++;
+        session.answered++; state.practice.answered++; logActivity(1);
         if (ok) { session.correct++; state.practice.correct++; session.streak++; } else session.streak = 0;
         state.practice.best = Math.max(state.practice.best, session.streak);
         save();
@@ -610,7 +659,7 @@
   /* =========================================================
      UNIT
      ========================================================= */
-  const TABS = [["learn", "Lesson"], ["vocab", "Vocabulary"], ["reading", "Reading"], ["practice", "Practice"], ["speaking", "Speaking"]];
+  const TABS = [["learn", "Lesson"], ["vocab", "Vocabulary"], ["reading", "Reading"], ["practice", "Practice"], ["speaking", "Speaking"], ["writing", "Writing"]];
 
   function unitPage(id, params) {
     const u = UNITS.find((x) => x.id === id);
@@ -640,7 +689,7 @@
       history.replaceState(null, "", `#/unit/${u.id}?tab=${k}`);
       stopSpeech();
       body.onclick = null;
-      ({ learn: renderLearn, vocab: renderVocab, reading: renderReading, practice: renderPractice, speaking: renderSpeaking })[k](body, u, show);
+      ({ learn: renderLearn, vocab: renderVocab, reading: renderReading, practice: renderPractice, speaking: renderSpeaking, writing: renderWriting })[k](body, u, show);
     };
     $$(".tab").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
     show(tab);
@@ -661,7 +710,7 @@
         <h3 class="h-small">Objectives</h3>
         <ul class="list-check">${u.objectives.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>
         <h3 class="h-small">Route</h3>
-        <ol class="list-num small"><li>Lesson</li><li>Vocabulary</li><li>Reading</li><li>Practice (${PASS_PCT}% to complete)</li><li>Speaking</li></ol>
+        <ol class="list-num small"><li>Lesson</li><li>Vocabulary</li><li>Reading</li><li>Practice (${PASS_PCT}% to complete)</li><li>Speaking</li><li>Writing</li></ol>
       </aside>
     </div>
     ${nextBtn("Vocabulary", "go-next")}`;
@@ -669,8 +718,9 @@
   }
 
   function renderVocab(el, u, show) {
+    const added = addUnitToDeck(u);
     el.innerHTML = `
-    <p class="muted">Try to recall each meaning before you reveal it.</p>
+    <p class="muted">Try to recall each meaning before you reveal it. ${added ? `These ${added} words have been added to your <a href="#/review">review deck</a>.` : `These words are in your <a href="#/review">review deck</a>.`}</p>
     <div class="vocab">
       ${u.vocab.map(([w, d, ex], i) => `
         <div class="vocab-row">
@@ -765,7 +815,9 @@
         rec.onresult = (ev) => {
           const heard = ev.results[0][0].transcript;
           const pct = similarity(target, heard);
-          out.innerHTML = `Heard: “${esc(heard)}” &middot; <b class="${pct >= 80 ? "t-ok" : pct >= 50 ? "t-mid" : "t-bad"}">${pct}% match</b>. ${pct >= 80 ? "Excellent." : pct >= 50 ? "Close. Try once more." : "Listen again and repeat it slowly."}`;
+          const heardSet = norm(heard).split(" ");
+          const marked = target.split(/\s+/).map((w) => { const n = norm(w); return n && !heardSet.includes(n) ? `<span class="missed">${esc(w)}</span>` : esc(w); }).join(" ");
+          out.innerHTML = `Heard: “${esc(heard)}” &middot; <b class="${pct >= 80 ? "t-ok" : pct >= 50 ? "t-mid" : "t-bad"}">${pct}% match</b>. ${pct >= 80 ? "Excellent." : pct >= 50 ? "Close. Try once more." : "Listen again and repeat it slowly."}${pct < 100 ? `<div class="speak-marked">${marked}</div><div class="muted">Words we didn't catch are underlined. Practise those.</div>` : ""}`;
         };
         rec.onerror = (ev) => { out.textContent = ev.error === "not-allowed" ? "Microphone permission was denied." : "Didn't catch that. Try again."; };
         rec.onend = () => { btn.disabled = false; btn.lastChild.textContent = " Speak"; };
@@ -787,7 +839,7 @@
       "c1-2": "Give a cautious, hedged opinion on whether social media harms society.",
       "c2-1": "Make a formal recommendation to your company's board.",
       "c2-2": "Give a short persuasive speech that uses at least two rhetorical devices."
-    }[u.id] || "Talk about the topic of this unit.";
+    }[u.id] || (window.LU_DATA.SPEAKING_PROMPTS || {})[u.id] || "Talk about the topic of this unit.";
   }
   function similarity(target, heard) {
     const tw = norm(target).split(" ");
@@ -867,6 +919,7 @@
         if (ex.t === "listen" && ex.audio) $(".fb", box).innerHTML += `<div class="muted small">Transcript: “${esc(ex.audio)}”</div>`;
       });
       const pct = Math.round((correct / list.length) * 100);
+      logActivity(list.length);
       const msg = onScore(pct, correct, list.length);
       $("#check", host).remove();
       $("#ex-score", host).innerHTML = `
@@ -929,7 +982,8 @@
      ========================================================= */
   function dashboard() {
     if (state.level == null) {
-      app.innerHTML = `<section class="page-head narrow"><p class="kicker">My progress</p><h1 class="display">Nothing here yet</h1><p class="lede">Take the placement test to find out where to start. It takes about 15 minutes.</p><div class="actions"><a class="btn btn-lg" href="#/test">Take the level test</a><a class="btn btn-lg btn-line" href="#/practice">Practise without a test</a></div></section>`;
+      app.innerHTML = `<section class="page-head narrow"><p class="kicker">My progress</p><h1 class="display">Nothing here yet</h1><p class="lede">Take the placement test to find out where to start. It takes about 15 minutes.</p><div class="actions"><a class="btn btn-lg" href="#/test">Take the level test</a><a class="btn btn-lg btn-line" href="#/practice">Practise without a test</a></div></section>${backupSection()}`;
+      bindBackup();
       return;
     }
     const L = lvl(state.level);
@@ -949,7 +1003,13 @@
       <div><span>${L.code} progress</span><b>${levelProgress(state.level)}<small>%</small></b></div>
       <div><span>Practice answered</span><b>${pr.answered}</b></div>
       <div><span>Practice accuracy</span><b>${pr.answered ? Math.round((pr.correct / pr.answered) * 100) + "<small>%</small>" : "—"}</b></div>
-      <div><span>Best streak</span><b>${pr.best}</b></div>
+      <div><span>Day streak</span><b>${dayStreak()}<small> day${dayStreak() === 1 ? "" : "s"}</small></b></div>
+    </section>
+
+    <section class="goal band">
+      <div class="goal-text"><span class="kicker">Today's goal</span><b>${Math.min(today(), DAILY_GOAL)} of ${DAILY_GOAL} questions</b>${today() >= DAILY_GOAL ? `<span class="tag tag-ok">Done</span>` : ""}</div>
+      <div class="goal-track"><b style="width:${Math.min(100, (today() / DAILY_GOAL) * 100)}%"></b></div>
+      <div class="goal-week">${weekStrip()}</div>
     </section>
 
     <section class="next-up">
@@ -961,11 +1021,12 @@
       </div>
       <div class="actions"><a class="btn btn-lg" href="${next ? `#/unit/${next.id}` : `#/level/${state.level}/test`}">${next ? "Continue" : "Start test"}</a><a class="btn btn-lg btn-line" href="#/practice?l=${state.level}">Practise</a></div>
     </section>
+    ${dueCount() ? `<section class="next-up next-up-quiet"><div><p class="kicker">Vocabulary review</p><h2>${dueCount()} word${dueCount() === 1 ? "" : "s"} due today</h2><p class="muted">Short daily reviews move words into long-term memory.</p></div><div class="actions"><a class="btn btn-lg btn-line" href="#/review">Review now</a></div></section>` : ""}
 
     <section class="cols band">
       <div>
         <h2 class="h-section">Placement skills</h2>
-        ${p ? `${skillBars(skillRowsOf(p))}<p class="small"><a href="#/results">Full results and study plan &rarr;</a></p>` : `<p class="muted">Take the <a href="#/test">placement test</a> to see your skill profile.</p>`}
+        ${p ? `${skillBars(skillRowsOf(p))}<p class="small"><a href="#/results">Full results and study plan &rarr;</a> &middot; <a href="#/certificate">Certificate &rarr;</a></p>` : `<p class="muted">Take the <a href="#/test">placement test</a> to see your skill profile.</p>`}
       </div>
       <div>
         <h2 class="h-section">Test history</h2>
@@ -975,15 +1036,339 @@
       </div>
     </section>
 
+    ${backupSection()}
+
     <section class="danger">
+      <a class="btn-text" href="#/settings">Voice &amp; audio settings</a> &middot;
       <button class="btn-text" id="reset">Reset all progress</button>
       <span id="reset-confirm" hidden>This deletes your level, scores and history. <button class="btn btn-sm btn-danger" id="reset-yes">Reset</button> <button class="btn btn-sm btn-line" id="reset-no">Cancel</button></span>
     </section>`;
 
+    bindBackup();
     $("#reset").onclick = () => ($("#reset-confirm").hidden = false);
     $("#reset-no").onclick = () => ($("#reset-confirm").hidden = true);
     $("#reset-yes").onclick = () => { state = defaultState(); seen = new Set(); save(); location.hash = "#/"; };
   }
+
+  /* =========================================================
+     WRITING (per unit)
+     ========================================================= */
+  const STOP = new Set("the a an and or but to of in on at for with is are was were be been it this that i you he she we they my your his her our their me him them as by from not do does did have has had will would can could should so if then than there here what which who when where how very just also about into up out".split(" "));
+  const wordsOf = (t) => (t.match(/[A-Za-z’']+/g) || []);
+
+  function renderWriting(el, u) {
+    const W = (window.LU_DATA.WRITING || {})[u.id];
+    if (!W) { el.innerHTML = `<p class="muted">No writing task for this unit yet.</p>`; return; }
+    const saved = state.writing[u.id] || { text: "", done: false };
+    el.innerHTML = `
+    <div class="cols cols-wide">
+      <div>
+        <p class="kicker">Writing task &middot; at least ${W.min} words</p>
+        <h2 class="w-prompt">${esc(W.prompt)}</h2>
+        <textarea id="w-text" class="w-text" rows="12" spellcheck="true" placeholder="Start writing here. Your draft is saved automatically.">${esc(saved.text)}</textarea>
+        <div class="w-bar"><span id="w-count" class="mono"></span><button class="btn" id="w-check">Check my writing</button></div>
+        <div id="w-out"></div>
+      </div>
+      <aside class="side">
+        <h3 class="h-small">Try to use</h3>
+        <ul class="list-num small"><li>${esc(u.grammar.title)}</li>${u.vocab.slice(0, 6).map((v) => `<li>${esc(v[0])}</li>`).join("")}</ul>
+        <h3 class="h-small">How it's checked</h3>
+        <p class="small muted">We check length, this unit's grammar and vocabulary, punctuation and repetition automatically. Then compare your text with the model answer. A teacher would also mark ideas and accuracy, so read the model answer closely.</p>
+        ${saved.done ? `<p><span class="tag tag-ok">Task complete</span></p>` : ""}
+      </aside>
+    </div>`;
+    const ta = $("#w-text", el);
+    const count = () => { const n = wordsOf(ta.value).length; $("#w-count", el).textContent = `${n} / ${W.min} words`; $("#w-count", el).classList.toggle("t-ok", n >= W.min); };
+    let timer = null;
+    ta.oninput = () => { count(); clearTimeout(timer); timer = setTimeout(() => { state.writing[u.id] = Object.assign(state.writing[u.id] || {}, { text: ta.value }); save(); }, 400); };
+    count();
+    $("#w-check", el).onclick = () => {
+      const text = ta.value.trim();
+      const words = wordsOf(text);
+      const low = text.toLowerCase().replace(/’/g, "'");
+      const sentences = text.split(/(?<=[.!?])\s+/).filter((x) => x.trim());
+      const usedVocab = u.vocab.filter((v) => { const key = v[0].toLowerCase().replace(/^(a|an|the) /, "").split(" ")[0].replace(/e$/, ""); return key.length > 2 && low.includes(key); }).map((v) => v[0]);
+      const freq = {};
+      words.forEach((w) => { const k = w.toLowerCase(); if (!STOP.has(k) && k.length > 3 && !/['’]/.test(k)) freq[k] = (freq[k] || 0) + 1; });
+      const repeated = Object.keys(freq).filter((k) => freq[k] > Math.max(3, words.length / 25));
+      const caps = sentences.filter((x) => /^[a-z]/.test(x.trim())).length;
+      const endsOk = /[.!?]["”')]?$/.test(text);
+      const grammarOk = new RegExp(W.check[0], "i").test(low);
+      const avg = sentences.length ? Math.round(words.length / sentences.length) : 0;
+      const checks = [
+        [words.length >= W.min, `Length: ${words.length} words`, words.length >= W.min ? "Long enough." : `Write at least ${W.min - words.length} more words.`],
+        [grammarOk, `Grammar: ${W.check[1]}`, grammarOk ? "Good, you used this unit's grammar." : `Try to include the unit's grammar: ${u.grammar.title}.`],
+        [usedVocab.length >= 2, `Vocabulary: ${usedVocab.length} unit word${usedVocab.length === 1 ? "" : "s"}`, usedVocab.length ? `You used: ${usedVocab.join(", ")}.` : "Use at least two words from this unit's vocabulary."],
+        [caps === 0 && endsOk, "Punctuation", caps === 0 && endsOk ? "Sentences start with capitals and end with punctuation." : `${caps ? `${caps} sentence${caps > 1 ? "s" : ""} start${caps > 1 ? "" : "s"} with a small letter. ` : ""}${endsOk ? "" : "End your last sentence with a full stop."}`],
+        [repeated.length === 0, "Variety", repeated.length ? `You repeat ${repeated.map((r) => `“${r}”`).join(", ")} a lot. Try a synonym.` : "Good range of words."],
+        [avg <= (u.level <= 2 ? 18 : 30), "Sentence length", `About ${avg} words per sentence.${avg > (u.level <= 2 ? 18 : 30) ? " Split some long sentences." : ""}`]
+      ];
+      const passed = checks.filter((c) => c[0]).length;
+      const done = checks[0][0] && checks[1][0] && passed >= 5;
+      state.writing[u.id] = { text: ta.value, done: done || !!saved.done, last: new Date().toISOString() };
+      if (done) logActivity(5);
+      save();
+      $("#w-out", el).innerHTML = `
+        <ul class="w-checks">${checks.map(([ok, label, note]) => `<li class="${ok ? "ok" : "bad"}"><b>${ok ? "✓" : "✗"} ${esc(label)}</b><span>${esc(note)}</span></li>`).join("")}</ul>
+        <p class="${done ? "t-ok" : ""}"><b>${done ? "Task complete." : `${passed} of ${checks.length} checks passed.`}</b> ${done ? "" : "Revise your text and check again."}</p>
+        <details class="model" ${done ? "open" : ""}><summary>Model answer</summary>
+          ${hasTTS ? `<div class="audio"><button class="btn btn-sm btn-line" data-speak="${esc(W.model)}">${ICON_PLAY} Listen</button></div>` : ""}
+          <p class="reading-text">${esc(W.model)}</p></details>`;
+    };
+  }
+
+  /* =========================================================
+     VOCABULARY REVIEW (spaced repetition, Leitner boxes)
+     ========================================================= */
+  function addUnitToDeck(u) {
+    let n = 0;
+    u.vocab.forEach(([w, d, ex]) => { if (!state.srs[w]) { state.srs[w] = { d, ex, u: u.id, b: 0, due: dayKey() }; n++; } });
+    if (n) save();
+    return n;
+  }
+  const dueCards = () => Object.keys(state.srs).filter((w) => state.srs[w].due <= dayKey());
+  const dueCount = () => dueCards().length;
+
+  function reviewPage() {
+    const total = Object.keys(state.srs).length;
+    const lvlN = state.level || 1;
+    if (!total) {
+      app.innerHTML = `
+      <section class="page-head narrow"><p class="kicker">Review</p><h1 class="display">Your review deck is empty</h1>
+      <p class="lede">Words are added when you open a unit's vocabulary. Then they come back for review on a schedule: tomorrow, in 2 days, 4, 8 and so on. Each review makes them stick for longer.</p>
+      <div class="actions"><button class="btn btn-lg" id="seed">Add all ${lvl(lvlN).code} words</button><a class="btn btn-lg btn-line" href="#/level/${lvlN}">Go to ${lvl(lvlN).code} units</a></div></section>`;
+      $("#seed").onclick = () => { unitsOf(lvlN).forEach(addUnitToDeck); reviewPage(); };
+      return;
+    }
+    const queue = shuffle(dueCards()).slice(0, 20);
+    const boxes = [0, 0, 0];
+    Object.values(state.srs).forEach((c) => boxes[c.b >= 5 ? 2 : c.b >= 2 ? 1 : 0]++);
+    let done = 0, known = 0;
+    app.innerHTML = `
+    <section class="page-head"><p class="kicker">Review</p><h1 class="display">Vocabulary review</h1>
+      <p class="lede">See the word, say what it means, then check. Be honest: words you miss come back sooner.</p></section>
+    <section class="stats-line">
+      <div><span>This session</span><b id="r-left">${queue.length}</b></div>
+      <div><span>Due today</span><b>${dueCount()}</b></div>
+      <div><span>Learning</span><b>${boxes[0]}</b></div>
+      <div><span>Familiar</span><b>${boxes[1]}</b></div>
+      <div><span>Mastered</span><b>${boxes[2]}</b></div>
+    </section>
+    <section class="sheet sheet-wide" id="card"></section>
+    <section class="danger"><span class="muted small">Add more words:</span> ${LEVELS.filter((L) => L.n <= Math.max(lvlN, 1) + 1).map((L) => `<button class="btn-text" data-add="${L.n}">${L.code}</button>`).join(" ")}</section>`;
+    $$("[data-add]").forEach((b) => (b.onclick = () => { const n = unitsOf(+b.dataset.add).reduce((a, u) => a + addUnitToDeck(u), 0); b.textContent = `${lvl(+b.dataset.add).code} +${n}`; }));
+
+    const card = $("#card");
+    function nextCard() {
+      $("#r-left").textContent = queue.length;
+      if (!queue.length) {
+        const next = Object.values(state.srs).map((c) => c.due).filter((d) => d > dayKey()).sort()[0];
+        card.innerHTML = `<div class="r-done"><h2 class="qtext">${done ? `Done. You knew ${known} of ${done}.` : "Nothing due right now."}</h2>
+          <p class="muted">${next ? `Next review: ${fmtDate(next + "T12:00:00")}.` : ""} Come back tomorrow to keep your streak going.</p>
+          <div class="actions"><a class="btn" href="#/practice?l=${lvlN}">Practise questions</a><a class="btn btn-line" href="#/dashboard">My progress</a></div></div>`;
+        document.onkeydown = null;
+        return;
+      }
+      const w = queue[0];
+      const c = state.srs[w];
+      const unit = UNITS.find((x) => x.id === c.u);
+      let revealed = false;
+      card.innerHTML = `
+        <div class="sheet-top"><span>${unit ? `${lvl(unit.level).code} &middot; ${esc(unit.title)}` : "Vocabulary"}</span><span class="muted">${done + 1} of ${done + queue.length}</span></div>
+        <div class="r-word">${sayBtn(w)}<b>${esc(w)}</b></div>
+        <p class="muted" id="r-hint">What does it mean? Say it aloud or in your head.</p>
+        <div class="r-back" id="r-back" hidden><p class="r-def">${esc(c.d)}</p><p class="vocab-ex">${sayBtn(c.ex)}<i>${esc(c.ex)}</i></p></div>
+        <div class="sheet-actions" id="r-act"><span></span><button class="btn" id="r-show">Show meaning</button></div>`;
+      const answer = (ok) => {
+        done++; if (ok) known++;
+        c.b = ok ? Math.min(c.b + 1, SRS_DAYS.length - 1) : 0;
+        c.due = ok ? addDays(SRS_DAYS[c.b]) : dayKey();
+        queue.shift();
+        if (!ok) queue.splice(Math.min(queue.length, 3), 0, w);
+        logActivity(1);
+        save();
+        nextCard();
+      };
+      const reveal = () => {
+        if (revealed) return;
+        revealed = true;
+        $("#r-back").hidden = false; $("#r-hint").hidden = true;
+        $("#r-act").innerHTML = `<button class="btn btn-line" id="r-no">Didn't know <span class="kbd">1</span></button><button class="btn" id="r-yes">Knew it <span class="kbd">2</span></button>`;
+        $("#r-no").onclick = () => answer(false);
+        $("#r-yes").onclick = () => answer(true);
+      };
+      $("#r-show").onclick = reveal;
+      document.onkeydown = (e) => {
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+        if (!revealed && (e.key === " " || e.key === "Enter")) { e.preventDefault(); reveal(); }
+        else if (revealed && e.key === "1") answer(false);
+        else if (revealed && (e.key === "2" || e.key === "Enter")) answer(true);
+      };
+    }
+    nextCard();
+  }
+
+  /* =========================================================
+     SETTINGS (voice & speed)
+     ========================================================= */
+  function settingsPage() {
+    const render = () => {
+      const vs = englishVoices();
+      if (!voice) pickVoice();
+      app.innerHTML = `
+      <section class="page-head narrow"><p class="kicker">Settings</p><h1 class="display">Voice &amp; audio</h1>
+        <p class="lede">Listening questions use the voices built into your device. Some sound much more natural than others, so pick the one you like best.</p></section>
+      ${!hasTTS ? `<p class="boxed">This browser doesn't support speech. Listening questions will show a transcript instead.</p>` : `
+      <section class="settings">
+        <label class="field"><span>Voice</span>
+          <select id="s-voice">${vs.length ? vs.map((v) => `<option value="${esc(v.voiceURI)}" ${voice && v.voiceURI === voice.voiceURI ? "selected" : ""}>${esc(v.name)} (${esc(v.lang)})${voiceScore(v) >= 40 ? " ★" : ""}</option>`).join("") : `<option>Default voice</option>`}</select>
+        </label>
+        <div class="field"><span>Speed</span>
+          <div class="seg" role="group" aria-label="Speed">${[[0.8, "Slow"], [0.9, "Relaxed"], [1, "Normal"], [1.15, "Fast"]].map(([r, l]) => `<button data-rate="${r}" class="${(state.settings.rate || 1) === r ? "on" : ""}">${l}</button>`).join("")}</div>
+        </div>
+        <div class="actions"><button class="btn" data-speak="Hello! This is how listening questions will sound. Is this voice clear for you?">${ICON_PLAY} Test voice</button><button class="btn btn-line" id="s-auto">Use recommended</button></div>
+        <p class="muted small">★ marks higher-quality voices. ${/iPhone|iPad|Mac/.test(navigator.userAgent) ? "On Apple devices you can download better voices in Settings → Accessibility → Spoken Content → Voices (look for “Enhanced” or “Premium”)." : "On Windows, Microsoft Edge offers the most natural voices (“Online (Natural)”). On Android, install more voices from Google's text-to-speech settings."}</p>
+      </section>`}`;
+      if (!hasTTS) return;
+      const sel = $("#s-voice");
+      if (sel) sel.onchange = () => { state.settings.voice = sel.value; save(); pickVoice(); };
+      $$("[data-rate]", app).forEach((b) => (b.onclick = () => { state.settings.rate = +b.dataset.rate; save(); $$("[data-rate]", app).forEach((x) => x.classList.toggle("on", x === b)); }));
+      $("#s-auto").onclick = () => { state.settings.voice = ""; state.settings.rate = 1; save(); pickVoice(); render(); };
+    };
+    render();
+    if (hasTTS && !speechSynthesis.getVoices().length) setTimeout(() => { if (location.hash === "#/settings") render(); }, 700);
+  }
+
+  /* =========================================================
+     CERTIFICATE
+     ========================================================= */
+  function certData() {
+    const p = state.placement;
+    return { n: state.name || "", l: p.level, b: p.band === "secure" ? 1 : 0, d: dayKey(new Date(p.date)), c: p.correct, t: p.total, s: SKILL_IDS.map((k) => (p.skills[k] == null ? -1 : Math.round(p.skills[k] * 10))) };
+  }
+  function certHTML(c, shared) {
+    const L = lvl(c.l);
+    const rows = SKILLS.map((s, i) => (c.s[i] < 0 ? null : { s, v: c.s[i] / 10 })).filter(Boolean).map((r) => ({ s: r.s, v: r.v, sl: lvl(Math.max(1, Math.min(6, Math.floor(r.v)))), pct: Math.max(3, Math.min(100, ((r.v - 1) / 5.99) * 100)) }));
+    return `
+    <article class="cert">
+      <div class="cert-top"><span class="cert-brand">LevelUp English</span><span class="mono">Placement result</span></div>
+      <p class="kicker">This is to record that</p>
+      <h1 class="cert-name">${c.n ? esc(c.n) : "<span class='muted'>Your name</span>"}</h1>
+      <p class="cert-line">was placed at CEFR level</p>
+      <div class="cert-level"><span class="cert-code">${L.code}</span><span>${L.name}<small>${c.b ? "Secure" : "Developing"} &middot; ${c.c} of ${c.t} correct</small></span></div>
+      ${ruler(c.l, { compact: true })}
+      ${skillBars(rows)}
+      <div class="cert-foot"><span>Date: ${fmtDate(c.d + "T12:00:00")}</span><span>Adaptive test, ${c.t} questions</span></div>
+      <p class="cert-note">Unofficial result from a free online adaptive test. It is not an accredited exam certificate.${shared ? "" : ""}</p>
+    </article>`;
+  }
+  function certificatePage() {
+    if (!state.placement) { location.hash = "#/test"; return; }
+    const render = () => {
+      const link = `${location.origin}${location.pathname}#/cert/${b64enc(certData())}`;
+      app.innerHTML = `
+      <section class="page-head narrow no-print"><p class="kicker">Certificate</p><h1 class="display">Your level certificate</h1>
+        <p class="lede">Add your name, then print it, save it as a PDF or share the link.</p></section>
+      <section class="settings no-print">
+        <label class="field"><span>Name on certificate</span><input id="c-name" type="text" maxlength="60" value="${esc(state.name)}" placeholder="Your full name" autocomplete="name"></label>
+        <div class="actions"><button class="btn" id="c-print">Print or save as PDF</button><button class="btn btn-line" id="c-copy">Copy share link</button><span id="c-msg" class="muted small"></span></div>
+      </section>
+      <div id="c-body">${certHTML(certData())}</div>`;
+      const inp = $("#c-name");
+      inp.oninput = () => { state.name = inp.value.trim(); save(); $("#c-body").innerHTML = certHTML(certData()); };
+      $("#c-print").onclick = () => window.print();
+      $("#c-copy").onclick = () => copyText(`${location.origin}${location.pathname}#/cert/${b64enc(certData())}`, $("#c-msg"));
+      return link;
+    };
+    render();
+  }
+  function certView(d) {
+    let c;
+    try { c = b64dec(d); if (!lvl(c.l) || !Array.isArray(c.s)) throw 0; } catch (e) { return notFound(); }
+    app.innerHTML = `${certHTML(c, true)}
+      <section class="band cta-line no-print"><p>What's your level? The test is free and takes about 15 minutes.</p><div class="actions"><a class="btn" href="#/test">Take the level test</a></div></section>`;
+  }
+  function copyText(text, msgEl) {
+    const done = () => { if (msgEl) { msgEl.textContent = "Copied."; setTimeout(() => (msgEl.textContent = ""), 2500); } };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, () => fallback());
+    else fallback();
+    function fallback() {
+      const t = document.createElement("textarea");
+      t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
+      document.body.appendChild(t); t.select();
+      try { document.execCommand("copy"); done(); } catch (e) { if (msgEl) msgEl.textContent = "Couldn't copy. Select and copy it manually."; }
+      t.remove();
+    }
+  }
+
+  /* =========================================================
+     BACKUP & TRANSFER (no account needed)
+     ========================================================= */
+  function weekStrip() {
+    const out = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const n = state.days[dayKey(d)] || 0;
+      out.push(`<span class="day${n >= DAILY_GOAL ? " full" : n ? " some" : ""}" title="${fmtDate(d.toISOString())}: ${n} questions"><i></i>${d.toLocaleDateString(undefined, { weekday: "narrow" })}</span>`);
+    }
+    return out.join("");
+  }
+  function backupSection() {
+    return `
+    <section class="band backup">
+      <h2 class="h-section">Move or back up your progress</h2>
+      <p class="muted">Your progress is stored in this browser only. To use another device, copy your transfer code here and paste it there, or download a backup file.</p>
+      <div class="cols">
+        <div>
+          <h3 class="h-small">This device</h3>
+          <div class="actions"><button class="btn btn-sm" id="b-copy">Copy transfer code</button><button class="btn btn-sm btn-line" id="b-file">Download backup file</button></div>
+          <p id="b-msg" class="muted small"></p>
+        </div>
+        <div>
+          <h3 class="h-small">Restore</h3>
+          <textarea id="b-code" class="w-text" rows="3" placeholder="Paste a transfer code"></textarea>
+          <div class="actions"><button class="btn btn-sm" id="b-restore">Restore from code</button><label class="btn btn-sm btn-line">Open backup file<input type="file" id="b-upload" accept="application/json,.json" hidden></label></div>
+          <p id="b-msg2" class="small"></p>
+        </div>
+      </div>
+    </section>`;
+  }
+  function exportState() { const s = Object.assign({}, state); delete s.seen; return { app: "levelup-english", v: 1, at: new Date().toISOString(), state: s }; }
+  function importState(obj, msgEl) {
+    const s = obj && obj.app === "levelup-english" && obj.state;
+    if (!s || typeof s !== "object" || !("units" in s)) { msgEl.textContent = "That doesn't look like a LevelUp English backup."; msgEl.className = "small t-bad"; return; }
+    try { localStorage.setItem(KEY, JSON.stringify(Object.assign({}, s, { seen: [] }))); } catch (e) { /* ignore */ }
+    state = load();
+    if (!localStorage.getItem(KEY)) state = Object.assign(defaultState(), s);
+    seen = new Set();
+    pickVoice();
+    msgEl.textContent = "Progress restored."; msgEl.className = "small t-ok";
+    setTimeout(() => router(), 900);
+  }
+  function bindBackup() {
+    $("#b-copy").onclick = () => copyText(b64enc(exportState()), $("#b-msg"));
+    $("#b-file").onclick = () => {
+      const blob = new Blob([JSON.stringify(exportState(), null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `levelup-english-backup-${dayKey()}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    };
+    $("#b-restore").onclick = () => {
+      const code = $("#b-code").value.trim();
+      if (!code) return;
+      try { importState(b64dec(code), $("#b-msg2")); } catch (e) { $("#b-msg2").textContent = "That code isn't valid. Copy the whole code and try again."; $("#b-msg2").className = "small t-bad"; }
+    };
+    $("#b-upload").onchange = (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => { try { importState(JSON.parse(r.result), $("#b-msg2")); } catch (err) { $("#b-msg2").textContent = "Couldn't read that file."; $("#b-msg2").className = "small t-bad"; } };
+      r.readAsText(f);
+    };
+  }
+
 
   /* ---------- boot ---------- */
   $(".nav-toggle").onclick = () => $(".nav").classList.toggle("open");

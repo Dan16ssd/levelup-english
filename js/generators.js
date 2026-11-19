@@ -758,7 +758,9 @@ window.LU_GEN = (function () {
     "b1-1": ["presentPerfect"], "b1-2": ["conditionals"],
     "b2-1": ["cond3", "wish"], "b2-2": ["reportedQ", "reportingVerbs"],
     "c1-1": ["inversion", "invertedCond", "cleft"], "c1-2": ["hedging", "advancedVocab"],
-    "c2-1": ["subjunctive", "fixedExpr"], "c2-2": ["connotation", "idioms"]
+    "c2-1": ["subjunctive", "fixedExpr"], "c2-2": ["connotation", "idioms"],
+    "a1-3": ["thereIs", "everyday"], "a2-3": ["modals", "quantity"], "b1-3": ["passive", "gerundInf"],
+    "b2-3": ["pastPerfect", "prefixes"], "c1-3": ["unreal", "advancedVocab"], "c2-3": ["emphatic", "fixedExpr"]
   };
 
   return { generate, generateSet, keyOf, UNIT_TOPICS, count: () => GENS.length, _gens: GENS, _build: build };

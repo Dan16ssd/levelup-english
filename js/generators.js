@@ -763,5 +763,7 @@ window.LU_GEN = (function () {
     "b2-3": ["pastPerfect", "prefixes"], "c1-3": ["unreal", "advancedVocab"], "c2-3": ["emphatic", "fixedExpr"]
   };
 
-  return { generate, generateSet, keyOf, UNIT_TOPICS, count: () => GENS.length, _gens: GENS, _build: build };
+  /* add-on files register more generators with LU_GEN.register and reuse these helpers */
+  const helpers = { rnd, pick, shuffle, sample, cap, art, others, person, twoPeople, JOBS, CITIES, DAYS, MONTHS, numWord, ORD };
+  return { generate, generateSet, keyOf, UNIT_TOPICS, register: G, helpers, count: () => GENS.length, _gens: GENS, _build: build };
 })();

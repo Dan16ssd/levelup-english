@@ -133,22 +133,51 @@
     const t = b && $(".audio-fallback", b);
     if (t) t.hidden = false;
   }
+  /* Dialogues are written one line per speaker ("A: …\nB: …") and are read with two different voices. */
+  const DIALOGUE_LINE = /^\s*([A-Z][A-Za-z .']{0,18}):\s+\S/;
+  const isDialogue = (t) => { const ls = String(t || "").split("\n").filter((l) => l.trim()); return ls.length > 1 && ls.every((l) => DIALOGUE_LINE.test(l)); };
+  const parseDialogue = (t) => String(t).split("\n").filter((l) => l.trim()).map((l) => { const i = l.indexOf(":"); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; });
+  const FEMALE_V = /samantha|karen|moira|tessa|serena|libby|sonia|aria|jenny|zira|hazel|susan|kate|martha|fiona|victoria|allison|ava\b|emma|olivia|natasha|catherine|female/i;
+  const MALE_V = /daniel|arthur|oliver|ryan|guy\b|david|mark|george|alex\b|james|thomas|christopher|eric|brian|william|\bmale/i;
+  function secondVoice() {
+    if (!voice) return null;
+    const vs = englishVoices().filter((v) => v.voiceURI !== voice.voiceURI && !NOVELTY.test(v.name));
+    const f = FEMALE_V.test(voice.name), m = !f && MALE_V.test(voice.name);
+    const opposite = vs.find((v) => (f ? !FEMALE_V.test(v.name) && MALE_V.test(v.name) : m ? FEMALE_V.test(v.name) : false));
+    return opposite || vs.find((v) => v.lang === voice.lang) || vs[0] || null;
+  }
+  function transcript(text) {
+    if (!isDialogue(text)) return `“${esc(text)}”`;
+    return parseDialogue(text).map(([who, line]) => `<span class="tline"><b>${esc(who)}:</b> ${esc(line)}</span>`).join("");
+  }
   function speak(text, rate, box) {
     if (!hasTTS) return;
     if (!voice) pickVoice();
     const go = () => {
-      const u = new SpeechSynthesisUtterance(text);
-      if (voice) u.voice = voice;
-      u.lang = voice ? voice.lang : "en-GB";
-      u.rate = Math.min(2, Math.max(0.4, (rate || 0.95) * (state.settings.rate || 1)));
+      const r = Math.min(2, Math.max(0.4, (rate || 0.95) * (state.settings.rate || 1)));
+      const lines = isDialogue(text) ? parseDialogue(text) : [[null, text]];
+      const v2 = lines.length > 1 ? secondVoice() : null;
+      const speakers = [];
       let started = false;
-      u.onstart = () => { started = true; };
-      u.onend = () => { if (current === u) current = null; };
-      u.onerror = (e) => { if (e.error !== "interrupted" && e.error !== "canceled") showTranscript(box); };
-      current = u; // keep a reference so Safari doesn't drop it mid-sentence
-      speechSynthesis.speak(u);
+      const batch = lines.map(([who, line], i) => {
+        const u = new SpeechSynthesisUtterance(line);
+        if (who && !speakers.includes(who)) speakers.push(who);
+        const n = who ? speakers.indexOf(who) : 0;
+        const vv = n % 2 === 1 && v2 ? v2 : voice;
+        if (vv) u.voice = vv;
+        u.lang = vv ? vv.lang : "en-GB";
+        u.rate = r;
+        if (n % 2 === 1 && !v2) u.pitch = 0.75; // only one voice installed: change the pitch instead
+        if (n >= 2) u.pitch = 1.25;
+        u.onstart = () => { started = true; };
+        if (i === lines.length - 1) u.onend = () => { if (current === batch) current = null; };
+        u.onerror = (e) => { if (e.error !== "interrupted" && e.error !== "canceled") showTranscript(box); };
+        return u;
+      });
+      current = batch; // keep references so Safari doesn't drop them mid-sentence
+      batch.forEach((u) => speechSynthesis.speak(u));
       if (speechSynthesis.paused) speechSynthesis.resume();
-      setTimeout(() => { if (!started && current === u) showTranscript(box); }, 3000);
+      setTimeout(() => { if (!started && current === batch) showTranscript(box); }, 3000);
     };
     if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); setTimeout(go, 80); } else go();
   }
@@ -158,18 +187,53 @@
     else unlockSpeech();
   }, true);
   document.addEventListener("touchend", () => unlockSpeech(), { passive: true });
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const SPEECH = window.LU_SPEECH;
+  const canSpeak = SPEECH.available();
+  /* Runs one recording on a button: the button toggles to Stop, status shows download / checking. */
+  function micRun(btn, status, opts = {}) {
+    if (btn._ctl) { btn._ctl.stop(); return null; }
+    const label = btn.lastChild.textContent;
+    const setL = (t) => { btn.lastChild.textContent = " " + t; };
+    const say = (t) => { if (status) status.innerHTML = t; };
+    const device = SPEECH.mode() === "device";
+    let listening = false, pct = 0;
+    const hint = () => (device && !SPEECH.modelCached() ? ` <span class="muted">The speech model (about ${SPEECH.MODEL_MB} MB) is downloading the first time${pct ? `: ${pct}%` : ""}.</span>` : "");
+    const ctl = SPEECH.listen(Object.assign({}, opts, {
+      onState: (st, info) => {
+        if (st === "listening") { listening = true; btn.classList.add("recording"); setL(device || opts.maxMs > 20000 ? "Stop" : "Listening…"); say(`<span class="rec-dot"></span> Listening. ${device || opts.maxMs > 20000 ? "Press Stop when you finish." : "Speak now."}${hint()}`); }
+        else if (st === "loading") { pct = (info && info.pct) || pct; if (listening && btn._ctl) say(`<span class="rec-dot"></span> Listening. Press Stop when you finish.${hint()}`); else { btn.disabled = true; setL("Please wait"); say(`Downloading the speech model${pct ? `: ${pct}%` : "…"} This only happens once.`); } }
+        else if (st === "processing") { btn.classList.remove("recording"); btn.disabled = true; setL("Checking…"); say("Checking what you said…"); }
+      }
+    }));
+    btn._ctl = ctl;
+    const finish = () => { btn._ctl = null; listening = false; btn.disabled = false; btn.classList.remove("recording"); setL(label.trim()); };
+    return ctl.done.then((r) => { finish(); say(""); return r; }, (e) => { finish(); say(`<span class="t-bad">${esc(SPEECH.errorText(e))}</span>`); return null; });
+  }
+  /* 60–120 second speaking answers: transcript, pace, pauses and target words used */
+  function fluencyHTML(r, words) {
+    if (!r.text) return `<p class="t-bad">We didn't hear anything. Check your microphone and try again.</p>`;
+    const n = r.text.split(/\s+/).length;
+    const used = (words || []).filter((w) => new RegExp("\\b" + w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(r.text));
+    const pace = r.wpm == null ? "" : r.wpm < 80 ? "slow: try to keep talking without stopping" : r.wpm < 110 ? "steady" : r.wpm <= 170 ? "a natural pace" : "fast: slow down a little so you're clear";
+    const ppm = r.pauses != null && r.seconds > 5 ? Math.round((r.pauses / r.seconds) * 60) : null;
+    return `<div class="fluency">
+      <div class="stats-line"><div><span>Words</span><b>${n}</b></div><div><span>Speaking time</span><b>${Math.round(r.seconds)}s</b></div>${r.wpm != null ? `<div><span>Pace</span><b>${r.wpm}<small> wpm</small></b></div>` : ""}${ppm != null ? `<div><span>Long pauses</span><b>${r.pauses}</b></div>` : ""}</div>
+      <p class="small">${pace ? `Your pace was ${pace}. ` : ""}${ppm != null ? (ppm <= 4 ? "You kept going well with few long pauses. " : "You paused quite often; fillers like “well…” or “let me think” help you keep going. ") : ""}${words && words.length ? `You used ${used.length} of the target words${used.length ? `: ${used.map(esc).join(", ")}` : ""}.` : ""}</p>
+      <p class="small muted">What we heard:</p><div class="passage">${esc(r.text)}</div></div>`;
+  }
   const sayBtn = (text, label) => `<button class="say" data-speak="${esc(text)}" aria-label="Listen">${ICON_SPEAKER}${label ? `<span>${label}</span>` : ""}</button>`;
 
   function audioBox(text) {
-    if (!hasTTS) return `<div class="audio"><span class="muted">Audio isn't supported in this browser. Transcript: “${esc(text)}”</span></div>`;
+    if (!hasTTS) return `<div class="audio"><span class="muted">Audio isn't supported in this browser. Transcript: ${transcript(text)}</span></div>`;
     return `<div class="audio">
       <button class="btn btn-sm" data-speak="${esc(text)}">${ICON_PLAY} Play recording</button>
       <button class="btn btn-sm btn-line" data-speak="${esc(text)}" data-rate="0.7">Slower</button>
       <span class="audio-note">Replay as often as you need.</span>
-      <p class="audio-fallback" hidden>No sound? Check your volume, and on iPhone make sure silent mode is off. Transcript: “${esc(text)}”</p></div>`;
+      ${isDialogue(text) ? `<span class="audio-note">Conversation &middot; ${parseDialogue(text).length} lines</span>` : ""}
+      <p class="audio-fallback" hidden>No sound? Check your volume, and on iPhone make sure silent mode is off. Transcript: ${transcript(text)}</p></div>`;
   }
 
+  let pageTimer = null;
   /* ---------- router ---------- */
   const routes = [
     [/^\/?$/, home],
@@ -184,6 +248,8 @@
     [/^\/dashboard$/, dashboard],
     [/^\/review$/, reviewPage],
     [/^\/talk$/, talkPage],
+    [/^\/exam$/, examHub],
+    [/^\/exam\/([\w-]+)$/, (k, params) => examRoute(k, params)],
     [/^\/settings$/, settingsPage],
     [/^\/certificate$/, certificatePage],
     [/^\/cert\/([\w-]+)$/, (d) => certView(d)]
@@ -192,6 +258,7 @@
     const raw = location.hash.replace(/^#/, "") || "/";
     const [path, query] = raw.split("?");
     stopSpeech();
+    clearInterval(pageTimer); pageTimer = null;
     document.onkeydown = null;
     for (const [re, fn] of routes) {
       const m = path.match(re);
@@ -330,7 +397,7 @@
       <div class="ticks">${Array.from({ length: T.total }, (_, i) => `<span class="${i < n - 1 ? "done" : i === n - 1 ? "now" : ""}"></span>`).join("")}</div>
       ${q.passage ? `<div class="passage">${esc(q.passage)}</div>` : ""}
       ${q.audio ? audioBox(q.audio) : ""}
-      ${q.audio && !hasTTS ? `<div class="passage">${esc(q.audio)}</div>` : ""}
+
       <h2 class="qtext">${esc(q.q)}</h2>
       <div class="options">${q.o.map((o, i) => `<button class="opt" data-i="${i}"><span class="key">${"ABCD"[i]}</span><span>${esc(o)}</span></button>`).join("")}</div>
       <div class="sheet-actions">
@@ -454,7 +521,7 @@
 
     <section class="band">
       <h2 class="h-section">Your study plan</h2>
-      <ol class="plan">
+      <ol class="exam-plan">
         ${plan.map((w, i) => `
           <li>
             <span class="plan-n">Week ${i + 1}</span>
@@ -560,7 +627,7 @@
         const fb = $("#pfb");
         fb.hidden = false;
         fb.className = "feedback " + (ok ? "ok" : "bad");
-        fb.innerHTML = `<b>${ok ? "Correct." : "Answer: " + esc(q.o[q.a]) + "."}</b> ${esc(q.x || "")}${q.audio ? `<div class="muted small">Transcript: “${esc(q.audio)}”</div>` : ""}`;
+        fb.innerHTML = `<b>${ok ? "Correct." : "Answer: " + esc(q.o[q.a]) + "."}</b> ${esc(q.x || "")}${q.audio ? `<div class="muted small">Transcript: ${transcript(q.audio)}</div>` : ""}`;
         $("#pgo").textContent = "Next question →";
         $("#pskip").hidden = true;
         renderStats();
@@ -788,8 +855,9 @@
   }
 
   function renderSpeaking(el, u) {
+    const device = SPEECH.mode() === "device";
     el.innerHTML = `
-    <p class="muted">Listen to each sentence, then say it aloud. ${SR ? "Press <b>Speak</b> and we'll check how closely you matched it." : "Speech recognition isn't available in this browser (try Chrome or Edge), so listen, repeat, and compare yourself."}</p>
+    <p class="muted">Listen to each sentence, then say it aloud. ${canSpeak ? "Press <b>Speak</b> and we'll check each word." + (device ? " Your voice is checked on this device by an open-source model and never uploaded." : "") : "Your browser can't record audio, so listen, repeat, and compare yourself."}</p>
     <div class="speak-list">
       ${u.speaking.map((s, i) => `
         <div class="speak-row" data-i="${i}">
@@ -797,34 +865,35 @@
           <p class="speak-text">${esc(s)}</p>
           <div class="speak-actions">
             <button class="btn btn-sm btn-line" data-speak="${esc(s)}">${ICON_PLAY} Listen</button>
-            ${SR ? `<button class="btn btn-sm rec">${ICON_MIC} Speak</button>` : ""}
+            ${canSpeak ? `<button class="btn btn-sm rec">${ICON_MIC} Speak</button>` : ""}
           </div>
           <div class="speak-result small"></div>
         </div>`).join("")}
     </div>
-    <div class="boxed"><h3>Speaking task</h3><p>Talk for 60 seconds about this: <b>${esc(speakingPrompt(u))}</b> Try to use this unit's grammar and vocabulary. Record yourself and listen back.</p></div>`;
-    if (!SR) return;
+    <div class="boxed"><h3>Speaking task</h3><p>Talk for 60 seconds about this: <b>${esc(speakingPrompt(u))}</b> Try to use this unit's grammar and vocabulary.</p>
+      ${canSpeak ? `<div class="actions"><button class="btn rec-long">${ICON_MIC} Record my answer</button></div><div class="speak-status small"></div><div class="long-result"></div>` : `<p class="muted small">Record yourself on your phone and listen back.</p>`}</div>`;
+    if (!canSpeak) return;
     $$(".speak-row", el).forEach((row) => {
       const target = u.speaking[+row.dataset.i];
       const btn = $(".rec", row);
       const out = $(".speak-result", row);
-      btn.onclick = () => {
-        let rec;
-        try { rec = new SR(); } catch (e) { out.textContent = "Couldn't start the microphone."; return; }
-        rec.lang = "en-GB"; rec.interimResults = false; rec.maxAlternatives = 1;
-        btn.disabled = true; btn.lastChild.textContent = " Listening…"; out.textContent = "";
-        rec.onresult = (ev) => {
-          const heard = ev.results[0][0].transcript;
-          const pct = similarity(target, heard);
-          const heardSet = norm(heard).split(" ");
-          const marked = target.split(/\s+/).map((w) => { const n = norm(w); return n && !heardSet.includes(n) ? `<span class="missed">${esc(w)}</span>` : esc(w); }).join(" ");
-          out.innerHTML = `Heard: “${esc(heard)}” &middot; <b class="${pct >= 80 ? "t-ok" : pct >= 50 ? "t-mid" : "t-bad"}">${pct}% match</b>. ${pct >= 80 ? "Excellent." : pct >= 50 ? "Close. Try once more." : "Listen again and repeat it slowly."}${pct < 100 ? `<div class="speak-marked">${marked}</div><div class="muted">Words we didn't catch are underlined. Practise those.</div>` : ""}`;
-        };
-        rec.onerror = (ev) => { out.textContent = ev.error === "not-allowed" ? "Microphone permission was denied." : "Didn't catch that. Try again."; };
-        rec.onend = () => { btn.disabled = false; btn.lastChild.textContent = " Speak"; };
-        rec.start();
+      btn.onclick = async () => {
+        const r = await micRun(btn, out, { maxMs: 12000 });
+        if (!r) return;
+        if (!r.text) { out.innerHTML = "Didn't catch that. Try again, a little louder."; return; }
+        const c = SPEECH.compare(target, r.text);
+        logActivity(1);
+        const marked = c.words.map((x) => (x.st === "ok" ? esc(x.w) : `<span class="${x.st === "close" ? "close" : "missed"}">${esc(x.w)}</span>`)).join(" ");
+        out.innerHTML = `Heard: “${esc(r.text)}” &middot; <b class="${c.score >= 80 ? "t-ok" : c.score >= 50 ? "t-mid" : "t-bad"}">${c.score}% match</b>. ${c.score >= 90 ? "Excellent." : c.score >= 70 ? "Good. Practise the marked words." : c.score >= 50 ? "Close. Try once more." : "Listen again and repeat it slowly."}${c.score < 100 ? `<div class="speak-marked">${marked}</div><div class="muted">Underlined words weren't heard; dotted words sounded like a different word.</div>` : ""}`;
       };
     });
+    const lb = $(".rec-long", el);
+    lb.onclick = async () => {
+      const r = await micRun(lb, $(".speak-status", el), { maxMs: 90000, silenceMs: 8000 });
+      if (!r) return;
+      logActivity(2);
+      $(".long-result", el).innerHTML = fluencyHTML(r, u.vocab.map((v) => v[0]));
+    };
   }
   function speakingPrompt(u) {
     return {
@@ -855,6 +924,7 @@
      ========================================================= */
   function mountExercises(host, list, onScore, onRetry) {
     const resp = list.map(() => null);
+    const results = list.map(() => false);
     const orders = {};
     host.innerHTML = `
       <ol class="ex-list">${list.map((ex, i) => exHTML(ex, i)).join("")}</ol>
@@ -917,11 +987,12 @@
         $(".fb", box).innerHTML = ok
           ? `<b class="t-ok">Correct.</b> ${ex.x ? esc(ex.x) : ""}`
           : `<b class="t-bad">Answer: ${esc(answerText)}.</b> ${ex.x ? esc(ex.x) : ""}`;
-        if (ex.t === "listen" && ex.audio) $(".fb", box).innerHTML += `<div class="muted small">Transcript: “${esc(ex.audio)}”</div>`;
+        if (ex.audio && !ex.sameAsAbove) $(".fb", box).innerHTML += `<div class="muted small">Transcript: ${transcript(ex.audio)}</div>`;
+        results[i] = ok;
       });
       const pct = Math.round((correct / list.length) * 100);
       logActivity(list.length);
-      const msg = onScore(pct, correct, list.length);
+      const msg = onScore(pct, correct, list.length, results);
       $("#check", host).remove();
       $("#ex-score", host).innerHTML = `
         <div class="score"><span class="score-n">${pct}<small>%</small></span><span class="muted">${correct} of ${list.length} correct</span></div>
@@ -932,10 +1003,14 @@
   }
 
   function exHTML(ex, i) {
-    const label = { mc: "Choose the answer", listen: "Listening", fill: "Complete the sentence", order: "Put the words in order" }[ex.t];
+    const label = ex.label || { mc: "Choose the answer", listen: "Listening", fill: "Complete the sentence", order: "Put the words in order" }[ex.t];
     let body = "";
-    if (ex.passage) body += `<div class="passage">${esc(ex.passage)}</div>`;
-    if (ex.t === "listen") body += audioBox(ex.audio) + (hasTTS ? "" : `<div class="passage">${esc(ex.audio)}</div>`);
+    if (ex.sameAsAbove) body += `<p class="small muted same-above">Use the same ${esc(ex.sameAsAbove)} as above.</p>`;
+    else {
+      if (ex.pre) body += `<p class="ex-pre">${esc(ex.pre)}</p>`;
+      if (ex.passage) body += `<div class="passage">${esc(ex.passage)}</div>`;
+      if (ex.audio) body += audioBox(ex.audio);
+    }
     if (ex.t === "mc" || ex.t === "listen") {
       body += `<p class="ex-q">${esc(ex.q)}</p><div class="options compact">${ex.o.map((o, k) => `<button class="opt" data-o="${k}"><span class="key">${"ABCD"[k]}</span><span>${esc(o)}</span></button>`).join("")}</div>`;
     } else if (ex.t === "fill") {
@@ -976,6 +1051,251 @@
       if (moved) return `<b>Passed. You've unlocked ${lvl(n + 1).code} ${lvl(n + 1).name}.</b> <a href="#/level/${n + 1}">Go to ${lvl(n + 1).code} &rarr;</a>`;
       return n === 6 ? `<b>C2 confirmed.</b>` : `<b>Passed.</b> You're already above this level.`;
     }, () => levelTest(n));
+  }
+
+
+  /* =========================================================
+     EXAM PRACTICE (IELTS-style and TOEIC-style)
+     ========================================================= */
+  const EX = window.LU_EXAM;
+  const EXAM_NOTE = "Original practice material in the style of the real tests. Scores are rough estimates, not official results.";
+  const EXAM_TASKS = {
+    "ielts-listening": { exam: "IELTS", name: "Listening: forms and discussions", desc: "Fill in a form from a phone call, then answer questions on discussions.", build: () => EX.ielts.form().concat(EX.many(EX.ielts.discussion, 2)) },
+    "ielts-reading": { exam: "IELTS", name: "Reading: True / False / Not given", desc: "Read an academic-style passage and decide if statements agree with it.", build: () => EX.ielts.reading() },
+    "ielts-writing": { exam: "IELTS", name: "Writing Task 2: essay", desc: "A 40-minute opinion, discussion or problem essay, with feedback.", page: (pr) => examWriting(pr) },
+    "ielts-speaking": { exam: "IELTS", name: "Speaking Part 2: cue card", desc: "One minute to prepare, then talk for up to two minutes.", page: (pr) => examSpeaking(pr) },
+    "ielts-mock": { exam: "IELTS", name: "Mini mock test", desc: "Listening and reading, 30 minutes, with a band estimate.", page: () => examMock("ielts") },
+    "toeic-p2": { exam: "TOEIC", name: "Part 2: Question and response", desc: "Hear a question and choose the best reply.", build: () => EX.many(EX.toeic.p2, 10) },
+    "toeic-p3": { exam: "TOEIC", name: "Part 3: Conversations", desc: "Short workplace conversations, two questions each.", build: () => EX.many(EX.toeic.p3, 4) },
+    "toeic-p5": { exam: "TOEIC", name: "Part 5: Incomplete sentences", desc: "Business grammar and vocabulary.", build: () => { const seen = new Set(), out = []; for (let i = 0; i < 40 && out.length < 12; i++) { const q = EX.toeic.p5(); if (!seen.has(q.q)) { seen.add(q.q); out.push(q); } } return out; } },
+    "toeic-p7": { exam: "TOEIC", name: "Part 7: Reading", desc: "Emails, notices, memos and adverts.", build: () => EX.many(EX.toeic.p7, 2) },
+    "toeic-mock": { exam: "TOEIC", name: "Mini mock test", desc: "37 questions in 25 minutes, with a score estimate.", page: () => examMock("toeic") }
+  };
+  function examHub() {
+    const col = (exam) => Object.entries(EXAM_TASKS).filter(([, t]) => t.exam === exam).map(([k, t]) => `
+      <a class="exam-task" href="#/exam/${k}"><b>${esc(t.name)}</b><span class="muted small">${esc(t.desc)}</span></a>`).join("");
+    const recent = state.history.filter((h) => h.type === "exam").slice(0, 6);
+    app.innerHTML = `
+    <section class="page-head"><p class="kicker">Exam practice</p><h1 class="display">IELTS and TOEIC practice</h1>
+      <p class="lede">Practise the question types used in the two most popular English exams, with timed mock tests and feedback on writing and speaking.</p>
+      <p class="muted small">${EXAM_NOTE} IELTS is a trademark of the British Council, IDP and Cambridge; TOEIC is a trademark of ETS. This site isn't connected with them.</p></section>
+    <section class="exam-cols">
+      <div class="exam-col"><p class="kicker">IELTS-style &middot; study, work and migration</p>${col("IELTS")}</div>
+      <div class="exam-col"><p class="kicker">TOEIC-style &middot; English for work</p>${col("TOEIC")}</div>
+    </section>
+    ${recent.length ? `<section class="sheet"><h2 class="h-section">Recent results</h2><table class="table"><tbody>${recent.map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${esc(h.name)}</td><td>${esc(h.result)}</td></tr>`).join("")}</tbody></table></section>` : ""}`;
+  }
+  function examHead(t, extra) {
+    return `<nav class="crumbs"><a href="#/exam">Exam practice</a> / ${t.exam}</nav>
+    <section class="unit-head"><p class="kicker">${t.exam}-style</p><h1 class="display display-sm">${esc(t.name)}</h1><p class="muted">${esc(t.desc)} ${extra || ""}</p></section>`;
+  }
+  function examRoute(k, params) {
+    const t = EXAM_TASKS[k];
+    if (!t) { location.hash = "#/exam"; return; }
+    if (t.page) { t.page(params); return; }
+    const list = t.build();
+    app.innerHTML = examHead(t, "A new set is generated every time.") + `<div id="ex-host"></div>`;
+    mountExercises($("#ex-host"), list, (pct) => {
+      state.history.unshift({ type: "exam", date: new Date().toISOString(), name: `${t.exam}-style ${t.name.split(":")[0]}`, result: `${pct}%` });
+      save();
+      return `${pct >= 80 ? "<b>Strong result.</b>" : pct >= 60 ? "<b>Good.</b>" : "<b>Keep practising.</b>"} ${k.startsWith("toeic") ? "In TOEIC, about 75% correct is roughly a B2-level score." : "In IELTS, about 75% correct is roughly band 7."} Press <b>Try again</b> for a new set, or go back to <a href="#/exam">all tasks</a>.`;
+    }, () => examRoute(k, params));
+  }
+  const mmss = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+  function startTimer(el, seconds, onEnd) {
+    clearInterval(pageTimer);
+    const end = Date.now() + seconds * 1000;
+    const tick = () => {
+      const left = Math.max(0, Math.round((end - Date.now()) / 1000));
+      if (el && el.isConnected) { el.textContent = mmss(left); el.classList.toggle("low", left <= 60); }
+      if (!left) { clearInterval(pageTimer); pageTimer = null; onEnd && onEnd(); }
+    };
+    tick();
+    pageTimer = setInterval(tick, 1000);
+  }
+  function examMock(kind) {
+    const t = EXAM_TASKS[kind + "-mock"];
+    const mins = kind === "toeic" ? 25 : 30;
+    app.innerHTML = examHead(t) + `
+    <section class="sheet narrow-sheet"><h2 class="h-section">Before you start</h2>
+      <ul class="list-check"><li>${mins} minutes for the whole test. When the time runs out, your answers are marked automatically.</li><li>Listening comes first. In the real test you hear each recording once; here you can replay, but try to listen only once.</li><li>Use headphones in a quiet place.</li></ul>
+      <div class="actions"><button class="btn btn-lg" id="mk-go">Start the ${mins}-minute test</button></div></section>`;
+    $("#mk-go").onclick = () => {
+      const list = kind === "toeic" ? EX.toeic.mock() : EX.ielts.mock();
+      app.innerHTML = examHead(t) + `<div class="exam-timer" role="timer"><span>Time left</span><b id="mk-time"></b></div><div id="ex-host"></div>`;
+      mountExercises($("#ex-host"), list, (pct, correct, total, results) => {
+        clearInterval(pageTimer); pageTimer = null;
+        const part = (sec) => { const idx = list.map((e, i) => (e.section === sec ? i : -1)).filter((i) => i >= 0); return idx.length ? Math.round((idx.filter((i) => results[i]).length / idx.length) * 100) : 0; };
+        const L = part("L"), R = part("R");
+        let result, html;
+        if (kind === "toeic") {
+          const ls = EX.toeicScale(L), rs = EX.toeicScale(R), tot = ls + rs;
+          result = `${tot} / 990 (est.)`;
+          html = `<div class="exam-result"><div><span>Listening</span><b>${ls}</b><small>${L}% correct</small></div><div><span>Reading</span><b>${rs}</b><small>${R}% correct</small></div><div><span>Total</span><b>${tot}</b><small>about ${EX.toeicToCEFR(tot)}</small></div></div>`;
+        } else {
+          const lb = EX.ieltsBand(L), rb = EX.ieltsBand(R), ov = Math.round(((lb + rb) / 2) * 2) / 2;
+          result = `Band ${ov} (est., L+R)`;
+          html = `<div class="exam-result"><div><span>Listening</span><b>${lb}</b><small>${L}% correct</small></div><div><span>Reading</span><b>${rb}</b><small>${R}% correct</small></div><div><span>Overall (L+R)</span><b>${ov}</b><small>about ${EX.bandToCEFR(ov)}</small></div></div>`;
+        }
+        state.history.unshift({ type: "exam", date: new Date().toISOString(), name: `${t.exam}-style mini mock`, result });
+        save();
+        return `${html}<p class="small muted">${EXAM_NOTE} A short test like this can easily be half a band or 50 points out either way.</p>${kind === "ielts" ? `Complete your estimate with <a href="#/exam/ielts-writing">Writing</a> and <a href="#/exam/ielts-speaking">Speaking</a>.` : ""}`;
+      }, () => examMock(kind));
+      startTimer($("#mk-time"), mins * 60, () => { const c = $("#check"); if (c) c.click(); });
+    };
+  }
+
+  /* --- AI marking for writing and speaking (optional) --- */
+  const band = { type: "object", additionalProperties: false, required: ["band", "comment"], properties: { band: { type: "number" }, comment: { type: "string" } } };
+  const MARK_SCHEMA = (crit) => ({
+    type: "object", additionalProperties: false, required: crit.concat(["overall", "summary", "improvements"]),
+    properties: Object.assign({}, ...crit.map((c) => ({ [c]: band })), {
+      overall: { type: "number" }, summary: { type: "string" },
+      improvements: { type: "array", items: { type: "object", additionalProperties: false, required: ["original", "better", "why"], properties: { original: { type: "string" }, better: { type: "string" }, why: { type: "string" } } } }
+    })
+  });
+  const CRIT_NAMES = { task_response: "Task response", coherence: "Coherence and cohesion", lexical: "Vocabulary", grammar: "Grammar", fluency: "Fluency and coherence" };
+  async function aiMark(host, { crit, system, content }) {
+    const local = aiProvider() === "local";
+    host.innerHTML = `<p class="muted">Marking your answer…</p><div class="dl" hidden><div class="dl-bar"><i></i></div><span></span></div>`;
+    try {
+      const txt = await aiGenerate({
+        system, maxTokens: 2500, schema: MARK_SCHEMA(crit),
+        messages: [{ role: "user", content: content + (local ? `\n\nReply only with JSON in this shape: {${crit.map((c) => `"${c}": {"band": 6, "comment": "..."}`).join(", ")}, "overall": 6, "summary": "...", "improvements": [{"original": "...", "better": "...", "why": "..."}]}` : "") }],
+        onProgress: (r) => { const d = $(".dl", host); if (d) { d.hidden = false; $("i", d).style.width = Math.round((r.progress || 0) * 100) + "%"; $("span", d).textContent = r.text || ""; } }
+      });
+      const o = parseLooseJSON(txt);
+      if (!o) { host.innerHTML = `<div class="passage">${esc(txt)}</div>`; return null; }
+      const b = (v) => { const n = Math.round(Number(v) * 2) / 2; return isFinite(n) && n > 0 ? Math.min(9, n) : null; };
+      const ov = b(o.overall) || (() => { const v = crit.map((c) => b(o[c] && o[c].band)).filter(Boolean); return v.length ? Math.round((v.reduce((a, x) => a + x, 0) / v.length) * 2) / 2 : null; })();
+      host.innerHTML = `
+        <div class="exam-result">${crit.map((c) => `<div><span>${CRIT_NAMES[c]}</span><b>${b(o[c] && o[c].band) || "–"}</b></div>`).join("")}<div><span>Overall</span><b>${ov || "–"}</b><small>${ov ? "about " + EX.bandToCEFR(ov) : ""}</small></div></div>
+        ${o.summary ? `<p>${esc(o.summary)}</p>` : ""}
+        <dl class="crit">${crit.map((c) => o[c] && o[c].comment ? `<dt>${CRIT_NAMES[c]}</dt><dd>${esc(o[c].comment)}</dd>` : "").join("")}</dl>
+        ${Array.isArray(o.improvements) && o.improvements.length ? `<h3 class="h-section">Improve these sentences</h3>${o.improvements.slice(0, 5).map((x) => `<div class="fix"><div><s>${esc(x.original || "")}</s></div><div><b>${esc(x.better || "")}</b></div>${x.why ? `<div class="muted">${esc(x.why)}</div>` : ""}</div>`).join("")}` : ""}
+        <p class="small muted">AI estimate${local ? " from the free on-device model, which is much less reliable than a human examiner" : ""}. Real examiners may score differently.</p>`;
+      return ov;
+    } catch (e) {
+      host.innerHTML = `<p class="t-bad">${esc(aiErrorText(e))}</p>`;
+      return null;
+    }
+  }
+  const noAIHint = () => `<p class="small muted">Want an estimated band and corrections? <a href="#/talk">Set up the AI partner</a> (there's a free option) and it will mark your answers here too.</p>`;
+
+  const LINKERS = /\b(however|moreover|furthermore|in addition|on the other hand|therefore|consequently|as a result|for example|for instance|in conclusion|to sum up|although|whereas|while|despite|nevertheless|firstly|secondly|finally|in contrast|similarly|this means|because of this)\b/gi;
+  function examWriting(params) {
+    const t = EXAM_TASKS["ielts-writing"];
+    let idx = +params.get("p");
+    if (!(idx >= 0 && idx < EX.WRITING.length)) idx = Math.floor(Math.random() * EX.WRITING.length);
+    const [type, prompt] = EX.WRITING[idx];
+    const key = "ielts-" + idx;
+    const saved = (state.writing[key] && state.writing[key].text) || "";
+    app.innerHTML = examHead(t, "Aim for at least 250 words in 40 minutes.") + `
+    <div class="cols cols-wide">
+      <div>
+        <div class="boxed"><p class="kicker">Task 2 &middot; ${esc({ opinion: "Opinion", discussion: "Discuss both views", problem: "Problem and solution", advantages: "Advantages and disadvantages" }[type])}</p><h2 class="w-prompt">${esc(prompt)}</h2></div>
+        <textarea id="w-text" class="w-text" rows="16" spellcheck="false" placeholder="Start writing. The 40-minute timer starts when you type.">${esc(saved)}</textarea>
+        <div class="w-bar"><span id="w-count" class="mono"></span><span class="exam-timer inline"><span>Time</span><b id="w-time">40:00</b></span><button class="btn" id="w-check">Get feedback</button></div>
+        <div id="w-out"></div>
+      </div>
+      <aside>
+        <h3 class="h-section">How to plan it</h3>
+        <ol class="exam-plan">${EX.PLANS[type].map((x) => `<li>${esc(x)}</li>`).join("")}</ol>
+        <p class="small muted">Spell-check is off, as in the real test.</p>
+        <p><a href="#/exam/ielts-writing?p=${(idx + 1) % EX.WRITING.length}">Try a different question &rarr;</a></p>
+      </aside>
+    </div>`;
+    const ta = $("#w-text"), cnt = $("#w-count");
+    let started = false;
+    const words = () => (ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0);
+    const upd = () => { const n = words(); cnt.textContent = `${n} words`; cnt.classList.toggle("t-ok", n >= 250); };
+    ta.oninput = () => {
+      upd();
+      state.writing[key] = { text: ta.value, done: false }; save();
+      if (!started) { started = true; startTimer($("#w-time"), 40 * 60, () => { $("#w-time").textContent = "Time's up"; }); }
+    };
+    upd();
+    $("#w-check").onclick = async () => {
+      const text = ta.value.trim(), n = words();
+      if (n < 40) { $("#w-out").innerHTML = `<p class="t-bad">Write at least a few paragraphs first.</p>`; return; }
+      const paras = text.split(/\n\s*\n|\n/).filter((p) => p.trim().split(/\s+/).length > 8).length;
+      const links = Array.from(new Set((text.match(LINKERS) || []).map((x) => x.toLowerCase())));
+      const opinion = /\b(i (strongly )?(believe|think|agree|disagree|feel)|in my (view|opinion)|from my perspective|i would argue)\b/i.test(text);
+      const sents = text.split(/[.!?]+/).filter((x) => x.trim()).length;
+      const stop = new Set("the a an and or but of to in on for is are be it this that with as at by from they their there was were have has not can will which who more people also".split(" "));
+      const freq = {};
+      text.toLowerCase().match(/[a-z']+/g).forEach((w) => { if (w.length > 3 && !stop.has(w)) freq[w] = (freq[w] || 0) + 1; });
+      const rep = Object.entries(freq).filter(([, c]) => c >= 5).sort((a, b) => b[1] - a[1]).slice(0, 4);
+      const row = (ok, txt) => `<li class="${ok ? "" : "warn"}">${txt}</li>`;
+      logActivity(3);
+      state.writing[key] = { text: ta.value, done: true }; save();
+      $("#w-out").innerHTML = `<section class="sheet"><h2 class="h-section">Checklist</h2><ul class="list-check">
+        ${row(n >= 250, `${n} words ${n >= 250 ? "(enough)" : "&middot; under 250 words loses marks for task response"}`)}
+        ${row(paras >= 4, `${paras} paragraph${paras === 1 ? "" : "s"} ${paras >= 4 ? "" : "&middot; aim for 4–5: introduction, two or three body paragraphs, conclusion"}`)}
+        ${row(links.length >= 4, `Linking words: ${links.length ? links.map(esc).join(", ") : "none found"}${links.length >= 4 ? "" : " &middot; use a few more to connect your ideas"}`)}
+        ${type !== "problem" ? row(opinion, opinion ? "Your opinion is clearly stated." : "We couldn't find a clear opinion. This question type asks for one.") : ""}
+        ${row(!rep.length, rep.length ? `Repeated words: ${rep.map(([w, c]) => `${esc(w)} (${c}×)`).join(", ")} &middot; vary them with synonyms` : "Good range: no words repeated too often.")}
+        ${row(sents && n / sents <= 28, `Average sentence length: ${sents ? Math.round(n / sents) : 0} words`)}
+      </ul></section><section class="sheet" id="w-ai">${hasAI() ? "" : noAIHint()}</section>`;
+      if (hasAI()) {
+        const ov = await aiMark($("#w-ai"), {
+          crit: ["task_response", "coherence", "lexical", "grammar"],
+          system: "You are an experienced, fair IELTS Writing examiner. Mark a Task 2 essay using the four public IELTS band descriptors (Task Response, Coherence and Cohesion, Lexical Resource, Grammatical Range and Accuracy). Give each a band from 1 to 9 in steps of 0.5 and a short comment written to the candidate in simple English. Essays under 250 words lose marks in Task Response. Then give the overall band, a two-sentence summary and up to 5 sentences from the essay rewritten at a higher level, each with a short reason. Be honest; do not inflate scores.",
+          content: `Question: ${prompt}\n\nCandidate's essay (${n} words):\n${text}`
+        });
+        if (ov) { state.history.unshift({ type: "exam", date: new Date().toISOString(), name: "IELTS-style Writing Task 2", result: `Band ${ov} (AI est.)` }); save(); }
+      }
+    };
+  }
+
+  function examSpeaking(params) {
+    const t = EXAM_TASKS["ielts-speaking"];
+    let idx = +params.get("c");
+    if (!(idx >= 0 && idx < EX.CUE_CARDS.length)) idx = Math.floor(Math.random() * EX.CUE_CARDS.length);
+    const [topic, points] = EX.CUE_CARDS[idx];
+    app.innerHTML = examHead(t) + `
+    <section class="cue">
+      <h2 class="w-prompt">${esc(topic)}</h2>
+      <p class="muted">You should say:</p><ul>${points.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>
+    </section>
+    <section class="sheet" id="sp-stage">
+      ${canSpeak ? `<p>You have <b>one minute</b> to prepare. You can make notes. Then speak for <b>one to two minutes</b>.</p>
+      <div class="actions"><button class="btn btn-lg" id="sp-prep">Start preparing</button><button class="btn btn-lg btn-line" id="sp-now">Skip to speaking</button></div>`
+      : `<p>Your browser can't record audio. Prepare for one minute, then record yourself on your phone for two minutes and listen back.</p>`}
+    </section>
+    <div id="sp-out"></div>
+    <p><a href="#/exam/ielts-speaking?c=${(idx + 1) % EX.CUE_CARDS.length}">Try a different card &rarr;</a></p>`;
+    if (!canSpeak) return;
+    const speakStage = () => {
+      clearInterval(pageTimer); pageTimer = null;
+      $("#sp-stage").innerHTML = `<p>Speak now for up to two minutes. Press <b>Stop</b> when you finish.</p>
+        <div class="actions"><button class="btn btn-lg" id="sp-rec">${ICON_MIC} Start speaking</button><span class="exam-timer inline"><span>Time</span><b id="sp-time">2:00</b></span></div><div class="speak-status small" id="sp-status"></div>`;
+      const btn = $("#sp-rec");
+      btn.onclick = async () => {
+        const first = !btn._ctl;
+        if (first) startTimer($("#sp-time"), 120, () => { if (btn._ctl) btn._ctl.stop(); });
+        const r = await micRun(btn, $("#sp-status"), { maxMs: 125000, silenceMs: 15000 });
+        clearInterval(pageTimer); pageTimer = null;
+        if (!r) return;
+        logActivity(3);
+        $("#sp-out").innerHTML = `<section class="sheet">${fluencyHTML(r, [])}${r.text && r.seconds < 60 ? `<p class="small">You spoke for under a minute. In the real test, keep going until the examiner stops you (two minutes).</p>` : ""}</section><section class="sheet" id="sp-ai">${hasAI() ? "" : noAIHint()}</section>`;
+        if (hasAI() && r.text) {
+          const ov = await aiMark($("#sp-ai"), {
+            crit: ["fluency", "lexical", "grammar"],
+            system: "You are an experienced, fair IELTS Speaking examiner. You will get a speech-recognition transcript of a Part 2 answer (so punctuation, filler words and some words may be missing or wrong; pronunciation cannot be judged). Estimate bands from 1 to 9 in steps of 0.5 for Fluency and Coherence, Lexical Resource and Grammatical Range and Accuracy, each with a short comment in simple English. Consider the length: a strong answer lasts about two minutes. Then give the overall band (average of the three), a two-sentence summary, and up to 5 phrases from the answer rewritten more naturally, each with a short reason.",
+            content: `Cue card: ${topic} (${points.join("; ")})\nSpeaking time: about ${Math.round(r.seconds)} seconds${r.wpm ? `, ${r.wpm} words per minute` : ""}.\n\nTranscript:\n${r.text}`
+          });
+          if (ov) { state.history.unshift({ type: "exam", date: new Date().toISOString(), name: "IELTS-style Speaking Part 2", result: `Band ${ov} (AI est.)` }); save(); }
+        }
+      };
+    };
+    $("#sp-now").onclick = speakStage;
+    $("#sp-prep").onclick = () => {
+      $("#sp-stage").innerHTML = `<div class="actions"><span class="exam-timer inline"><span>Preparation</span><b id="sp-time">1:00</b></span><button class="btn btn-line" id="sp-ready">I'm ready</button></div>
+        <textarea class="w-text" rows="4" placeholder="Notes (only for you)"></textarea>`;
+      $("#sp-ready").onclick = speakStage;
+      startTimer($("#sp-time"), 60, speakStage);
+    };
   }
 
   /* =========================================================
@@ -1032,7 +1352,7 @@
       <div>
         <h2 class="h-section">Test history</h2>
         ${state.history.length ? `<table class="table"><thead><tr><th>Date</th><th>Test</th><th>Result</th></tr></thead><tbody>
-          ${state.history.slice(0, 10).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement" : h.type === "talk" ? `Conversation: ${esc(h.scenario)}` : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} &middot; ${h.correct}/${h.total}` : h.type === "talk" ? `${esc(h.est)} (AI estimate)` : `${h.score}% ${h.passed ? "pass" : "fail"}`}</td></tr>`).join("")}
+          ${state.history.slice(0, 10).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement" : h.type === "talk" ? `Conversation: ${esc(h.scenario)}` : h.type === "exam" ? esc(h.name) : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} &middot; ${h.correct}/${h.total}` : h.type === "talk" ? `${esc(h.est)} (AI estimate)` : h.type === "exam" ? esc(h.result) : `${h.score}% ${h.passed ? "pass" : "fail"}`}</td></tr>`).join("")}
         </tbody></table>` : `<p class="muted">No tests yet.</p>`}
       </div>
     </section>
@@ -1230,6 +1550,13 @@
         <div class="actions"><button class="btn" data-speak="Hello! This is how listening questions will sound. Is this voice clear for you?">${ICON_PLAY} Test voice</button><button class="btn btn-line" id="s-auto">Use recommended</button></div>
         <p class="muted small">★ marks higher-quality voices. ${/iPhone|iPad|Mac/.test(navigator.userAgent) ? "On Apple devices you can download better voices in Settings → Accessibility → Spoken Content → Voices (look for “Enhanced” or “Premium”)." : "On Windows, Microsoft Edge offers the most natural voices (“Online (Natural)”). On Android, install more voices from Google's text-to-speech settings."}</p>
       </section>`}`;
+      app.insertAdjacentHTML("beforeend", `
+      <section class="settings"><h2 class="h-section">Speech recognition</h2>
+        <p class="muted small">Used when you press <b>Speak</b>. The browser option is fast but, in Chrome, sends your voice to Google. The on-device option downloads an open-source model (about ${SPEECH.MODEL_MB} MB, once) and works in every modern browser, including Safari and Firefox.</p>
+        <div class="seg" role="group" aria-label="Speech recognition">${[["auto", "Automatic"], ["browser", "Browser"], ["device", "On this device"]].map(([k, l]) => `<button data-asr="${k}" class="${SPEECH.pref() === k ? "on" : ""}" ${(k === "browser" && !SPEECH.hasBrowserSR) || (k === "device" && !SPEECH.canRecord) ? "disabled" : ""}>${l}</button>`).join("")}</div>
+        <p class="small" id="asr-now">Now using: <b>${{ browser: "the browser's speech service", device: "the on-device model", "": "nothing (this browser can't record audio)" }[SPEECH.mode()]}</b></p>
+      </section>`);
+      $$("[data-asr]", app).forEach((b) => (b.onclick = () => { SPEECH.setPref(b.dataset.asr); location.reload(); }));
       if (!hasTTS) return;
       const sel = $("#s-voice");
       if (sel) sel.onchange = () => { state.settings.voice = sel.value; save(); pickVoice(); };
@@ -1694,8 +2021,9 @@ For your very first message, when the learner hasn't written anything yet, the f
     <form class="composer" id="composer">
       <textarea id="t-in" rows="2" placeholder="Write your reply…" maxlength="1200"></textarea>
       <div class="composer-actions">
-        ${SR ? `<button type="button" class="btn btn-line btn-sm" id="t-mic">${ICON_MIC} Speak</button>` : ""}
+        ${canSpeak ? `<button type="button" class="btn btn-line btn-sm" id="t-mic">${ICON_MIC} Speak</button>` : ""}
         <span class="mono" id="t-count"></span>
+        <span class="small" id="t-mic-status"></span>
         <button class="btn" id="t-send" type="submit">Send</button>
       </div>
     </form>
@@ -1716,15 +2044,11 @@ For your very first message, when the learner hasn't written anything yet, the f
     $("#t-end").disabled = TALK.busy || learnerTurns < 2;
     if (learnerTurns >= MAX_TURNS) $("#t-in").placeholder = "That's the end of this conversation. Get your feedback.";
   }
-  function dictate(inp, btn) {
-    let rec;
-    try { rec = new SR(); } catch (e) { return; }
-    rec.lang = "en-GB"; rec.interimResults = false; rec.maxAlternatives = 1;
-    btn.disabled = true; btn.lastChild.textContent = " Listening…";
-    rec.onresult = (ev) => { const t = ev.results[0][0].transcript; inp.value = (inp.value ? inp.value + " " : "") + t; inp.focus(); };
-    rec.onerror = (ev) => { if (ev.error === "not-allowed") alertLine("Microphone permission was denied."); };
-    rec.onend = () => { btn.disabled = false; btn.lastChild.textContent = " Speak"; };
-    rec.start();
+  async function dictate(inp, btn) {
+    const st = $("#t-mic-status");
+    const r = await micRun(btn, st, { maxMs: 30000, silenceMs: 2500 });
+    if (r && r.text) { inp.value = (inp.value ? inp.value + " " : "") + r.text; inp.focus(); }
+    else if (r) alertLine("Didn't catch that. Try again.");
   }
   function alertLine(msg) { const c = $("#chat"); if (c) c.insertAdjacentHTML("beforeend", `<div class="chat-error">${esc(msg)}</div>`); }
 
@@ -1828,7 +2152,7 @@ For your very first message, when the learner hasn't written anything yet, the f
     }
   };
   /* Small local models don't support schemas, so accept anything close and fall back to plain text. */
-  function readFeedback(txt) {
+  function parseLooseJSON(txt) {
     txt = String(txt || "").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
     const i = txt.indexOf("{");
     if (i < 0) return null;
@@ -1846,7 +2170,13 @@ For your very first message, when the learner hasn't written anything yet, the f
     const parse = (t) => { try { return JSON.parse(t); } catch (e) { return null; } };
     try {
       const body = txt.slice(i);
-      const o = parse(body.slice(0, body.lastIndexOf("}") + 1)) || parse(closeJSON(body)) || JSON.parse(closeJSON(body.replace(/,\s*"[^"]*"?\s*:?\s*"?[^"{}\[\]]*$/, "")));
+      return parse(body.slice(0, body.lastIndexOf("}") + 1)) || parse(closeJSON(body)) || JSON.parse(closeJSON(body.replace(/,\s*"[^"]*"?\s*:?\s*"?[^"{}\[\]]*$/, "")));
+    } catch (e) { return null; }
+  }
+  function readFeedback(txt) {
+    const o = parseLooseJSON(txt);
+    if (!o) return null;
+    try {
       const arr = (x) => (Array.isArray(x) ? x : x ? [x] : []).map((v) => (typeof v === "string" ? v : v && typeof v === "object" ? v : String(v)));
       const lv = String(o.level || "").toUpperCase().match(/[ABC][12]/);
       /* small models can loop and repeat themselves: drop duplicates and keep the lists short */

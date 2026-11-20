@@ -124,9 +124,26 @@
     unlocked = true;
     try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch (e) { /* ignore */ }
   }
+  const VOICE = window.LU_VOICE;
   function stopSpeech() {
     if (hasTTS && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
     current = null;
+    VOICE.stop();
+  }
+  /* natural AI voice when it's switched on and loaded; device voices otherwise */
+  function speakNatural(text, rate, box) {
+    const note = box && $(".audio-note", box);
+    const old = note && note.textContent;
+    const restore = () => { if (note && note.isConnected) note.textContent = old; };
+    if (hasTTS && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
+    VOICE.play(text, (rate || 0.95) / 0.95 * (state.settings.rate || 1), {
+      onWait: () => { if (note) note.textContent = "Preparing natural voice…"; },
+      /* on slower devices, don't keep the learner waiting: use the device voice this time;
+         the natural version keeps preparing and is ready for the replay */
+      onSlow: () => { restore(); if (note) note.textContent = "Natural voice ready for your replay."; if (hasTTS) speakDevice(text, rate, box); },
+      onStart: restore,
+      onError: () => { restore(); VOICE.setEnabled(false); speak(text, rate, box); }
+    });
   }
   function showTranscript(box) {
     const b = box || $(".audio");
@@ -151,6 +168,11 @@
     return parseDialogue(text).map(([who, line]) => `<span class="tline"><b>${esc(who)}:</b> ${esc(line)}</span>`).join("");
   }
   function speak(text, rate, box) {
+    if (VOICE.enabled() && VOICE.ready()) { speakNatural(text, rate, box); return; }
+    if (VOICE.enabled()) VOICE.load().catch(() => {});
+    speakDevice(text, rate, box);
+  }
+  function speakDevice(text, rate, box) {
     if (!hasTTS) return;
     if (!voice) pickVoice();
     const go = () => {
@@ -183,7 +205,7 @@
   }
   document.addEventListener("click", (e) => {
     const b = e.target.closest("[data-speak]");
-    if (b) { e.preventDefault(); unlocked = true; speak(b.getAttribute("data-speak"), parseFloat(b.getAttribute("data-rate")) || 0.95, b.closest(".audio")); }
+    if (b) { e.preventDefault(); unlocked = true; VOICE.unlock(); speak(b.getAttribute("data-speak"), parseFloat(b.getAttribute("data-rate")) || 0.95, b.closest(".audio")); }
     else unlockSpeech();
   }, true);
   document.addEventListener("touchend", () => unlockSpeech(), { passive: true });
@@ -1551,12 +1573,36 @@
         <p class="muted small">★ marks higher-quality voices. ${/iPhone|iPad|Mac/.test(navigator.userAgent) ? "On Apple devices you can download better voices in Settings → Accessibility → Spoken Content → Voices (look for “Enhanced” or “Premium”)." : "On Windows, Microsoft Edge offers the most natural voices (“Online (Natural)”). On Android, install more voices from Google's text-to-speech settings."}</p>
       </section>`}`;
       app.insertAdjacentHTML("beforeend", `
+      <section class="settings"><h2 class="h-section">Natural AI voice</h2>
+        <p class="muted small">Replaces your device's voice with a much more natural open-source AI voice (Kokoro). It downloads once (about ${VOICE.MB} MB${VOICE.gpuLikely ? ", using your graphics card for speed" : ""}) and then runs on this device. In conversations, each speaker gets their own voice. The first play of each recording takes a moment to prepare.</p>
+        ${VOICE.supported ? `<div class="seg" role="group" aria-label="Voice type"><button data-tts="device" class="${VOICE.enabled() ? "" : "on"}">Device voice</button><button data-tts="natural" class="${VOICE.enabled() ? "on" : ""}">Natural AI voice</button></div>
+        <div class="seg" role="group" aria-label="Accent" ${VOICE.enabled() ? "" : "hidden"} id="tts-accent"><button data-acc="gb" class="${VOICE.accent() === "gb" ? "on" : ""}">British</button><button data-acc="us" class="${VOICE.accent() === "us" ? "on" : ""}">American</button></div>
+        <div class="dl" id="tts-dl" hidden><div class="dl-bar"><i></i></div><span></span></div>
+        <div class="actions"><button class="btn btn-line" data-speak="Anna: Hi Tom! Are you free on Saturday?\nTom: I think so. Why, what's happening?\nAnna: We're having a picnic in the park. Would you like to come?">${ICON_PLAY} Play a sample conversation</button></div>` : `<p class="small">This browser can't run the natural voice.</p>`}
+      </section>
       <section class="settings"><h2 class="h-section">Speech recognition</h2>
         <p class="muted small">Used when you press <b>Speak</b>. The browser option is fast but, in Chrome, sends your voice to Google. The on-device option downloads an open-source model (about ${SPEECH.MODEL_MB} MB, once) and works in every modern browser, including Safari and Firefox.</p>
         <div class="seg" role="group" aria-label="Speech recognition">${[["auto", "Automatic"], ["browser", "Browser"], ["device", "On this device"]].map(([k, l]) => `<button data-asr="${k}" class="${SPEECH.pref() === k ? "on" : ""}" ${(k === "browser" && !SPEECH.hasBrowserSR) || (k === "device" && !SPEECH.canRecord) ? "disabled" : ""}>${l}</button>`).join("")}</div>
         <p class="small" id="asr-now">Now using: <b>${{ browser: "the browser's speech service", device: "the on-device model", "": "nothing (this browser can't record audio)" }[SPEECH.mode()]}</b></p>
       </section>`);
       $$("[data-asr]", app).forEach((b) => (b.onclick = () => { SPEECH.setPref(b.dataset.asr); location.reload(); }));
+      const dl = $("#tts-dl");
+      const loadVoice = () => {
+        if (VOICE.ready()) { if (dl) { dl.hidden = false; $("i", dl).style.width = "100%"; $("span", dl).textContent = "Natural voice ready."; } return; }
+        if (dl) { dl.hidden = false; $("span", dl).textContent = "Downloading the voice model…"; }
+        VOICE.load((pct) => { if (dl && dl.isConnected) { $("i", dl).style.width = pct + "%"; $("span", dl).textContent = `Downloading the voice model: ${pct}%`; } })
+          .then(() => { if (dl && dl.isConnected) { $("i", dl).style.width = "100%"; $("span", dl).textContent = "Natural voice ready. Try the sample."; } })
+          .catch(() => { if (dl && dl.isConnected) $("span", dl).innerHTML = `<span class="t-bad">Couldn't download the voice model. Check your connection and try again.</span>`; VOICE.setEnabled(false); });
+      };
+      $$("[data-tts]", app).forEach((b) => (b.onclick = () => {
+        const on = b.dataset.tts === "natural";
+        VOICE.setEnabled(on);
+        $$("[data-tts]", app).forEach((x) => x.classList.toggle("on", x === b));
+        $("#tts-accent").hidden = !on;
+        if (on) loadVoice(); else if (dl) dl.hidden = true;
+      }));
+      $$("[data-acc]", app).forEach((b) => (b.onclick = () => { VOICE.setAccent(b.dataset.acc); $$("[data-acc]", app).forEach((x) => x.classList.toggle("on", x === b)); }));
+      if (VOICE.enabled()) loadVoice();
       if (!hasTTS) return;
       const sel = $("#s-voice");
       if (sel) sel.onchange = () => { state.settings.voice = sel.value; save(); pickVoice(); };
@@ -2257,6 +2303,13 @@ For your very first message, when the learner hasn't written anything yet, the f
 
   /* ---------- boot ---------- */
   $(".nav-toggle").onclick = () => $(".nav").classList.toggle("open");
+  /* natural voice: load it from the browser cache and prepare the recordings on screen in advance */
+  if (VOICE.enabled()) {
+    let t = null;
+    const prefetchVisible = () => { clearTimeout(t); t = setTimeout(() => { if (VOICE.ready()) $$(".audio button[data-speak]:not([data-rate])", app).slice(0, 3).forEach((b) => VOICE.prefetch(b.getAttribute("data-speak"), state.settings.rate || 1)); }, 400); };
+    setTimeout(() => VOICE.load().then(prefetchVisible).catch(() => {}), 1200);
+    new MutationObserver(prefetchVisible).observe(app, { childList: true, subtree: true });
+  }
   window.addEventListener("hashchange", router);
   router();
 })();

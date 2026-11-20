@@ -1,0 +1,15 @@
+name = "levelup-ai"
+main = "ai-proxy.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Comma-separated list of sites allowed to use the proxy.
+ALLOWED_ORIGINS = "https://dan16ssd.github.io"
+MODEL = "claude-opus-5-5"
+
+# Optional: per-visitor rate limit. Uncomment to enable; check the current syntax in
+# Cloudflare's docs: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+# [[ratelimits]]
+# name = "RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 20, period = 60 }

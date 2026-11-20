@@ -183,6 +183,7 @@
     [/^\/unit\/([\w-]+)$/, unitPage],
     [/^\/dashboard$/, dashboard],
     [/^\/review$/, reviewPage],
+    [/^\/talk$/, talkPage],
     [/^\/settings$/, settingsPage],
     [/^\/certificate$/, certificatePage],
     [/^\/cert\/([\w-]+)$/, (d) => certView(d)]
@@ -1031,7 +1032,7 @@
       <div>
         <h2 class="h-section">Test history</h2>
         ${state.history.length ? `<table class="table"><thead><tr><th>Date</th><th>Test</th><th>Result</th></tr></thead><tbody>
-          ${state.history.slice(0, 10).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement" : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} &middot; ${h.correct}/${h.total}` : `${h.score}% ${h.passed ? "pass" : "fail"}`}</td></tr>`).join("")}
+          ${state.history.slice(0, 10).map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${h.type === "placement" ? "Placement" : h.type === "talk" ? `Conversation: ${esc(h.scenario)}` : `${lvl(h.level).code} level test`}</td><td>${h.type === "placement" ? `${lvl(h.level).code} &middot; ${h.correct}/${h.total}` : h.type === "talk" ? `${esc(h.est)} (AI estimate)` : `${h.score}% ${h.passed ? "pass" : "fail"}`}</td></tr>`).join("")}
         </tbody></table>` : `<p class="muted">No tests yet.</p>`}
       </div>
     </section>
@@ -1369,6 +1370,378 @@
     };
   }
 
+
+  /* =========================================================
+     AI CONVERSATION PARTNER (Claude)
+     ========================================================= */
+  const CFG = window.LU_CONFIG || {};
+  const AI_KEY_STORE = "levelup-ai-key"; // kept apart from progress so it never ends up in backups or transfer codes
+  const AI_MODEL = CFG.aiModel || "claude-opus-5-5";
+  const SDK_URL = "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.6.0/+esm";
+  const MAX_TURNS = 40;
+  const getAIKey = () => { try { return localStorage.getItem(AI_KEY_STORE) || ""; } catch (e) { return ""; } };
+  const hasAI = () => !!(CFG.aiProxy || getAIKey());
+
+  let sdkPromise = null;
+  function loadSDK() {
+    if (!sdkPromise) sdkPromise = import(SDK_URL).then((m) => m.default || m.Anthropic).catch((e) => { sdkPromise = null; throw e; });
+    return sdkPromise;
+  }
+  async function aiClient() {
+    const Anthropic = await loadSDK();
+    if (CFG.aiProxy) return { Anthropic, client: new Anthropic({ apiKey: "via-proxy", baseURL: CFG.aiProxy.replace(/\/+$/, ""), dangerouslyAllowBrowser: true, maxRetries: 1 }) };
+    return { Anthropic, client: new Anthropic({ apiKey: getAIKey(), dangerouslyAllowBrowser: true, maxRetries: 1 }) };
+  }
+  function aiErrorText(err, Anthropic) {
+    if (Anthropic && err instanceof Anthropic.AuthenticationError) return CFG.aiProxy ? "The conversation service rejected the request. Please try again later." : "Your API key wasn't accepted. Check it and enter it again.";
+    if (Anthropic && err instanceof Anthropic.PermissionDeniedError) return "This API key isn't allowed to use the model. Check your Anthropic account.";
+    if (Anthropic && err instanceof Anthropic.RateLimitError) return "Too many messages in a short time. Wait a minute and try again.";
+    if (Anthropic && err instanceof Anthropic.BadRequestError) return /credit|billing/i.test(err.message) ? "Your Anthropic account has no credit left. Add credit in the Anthropic Console." : "The request was rejected: " + err.message;
+    if (Anthropic && err instanceof Anthropic.APIConnectionError) return "Couldn't reach the conversation service. Check your internet connection.";
+    if (Anthropic && err instanceof Anthropic.APIError) return "The conversation service had a problem (" + (err.status || "error") + "). Try again in a moment.";
+    return "Couldn't load the conversation service. Check your connection and try again.";
+  }
+
+  const SCENARIOS = [
+    { id: "free", name: "Free conversation", lv: [1, 6], role: "a friendly conversation partner", brief: "A relaxed chat. Ask the learner about their life, interests and opinions, and share a little about yourself (you are an English speaker who loves travel, food and books)." },
+    { id: "unit", name: "Your current unit", lv: [1, 6], role: "a friendly conversation partner", brief: "" },
+    { id: "cafe", name: "Ordering at a café", lv: [1, 2], role: "a barista in a busy London café", brief: "The learner is a customer ordering drinks and food. Offer choices, sizes and prices in pounds, and take payment." },
+    { id: "directions", name: "Asking for directions", lv: [1, 2], role: "a helpful local person in the street", brief: "The learner is a tourist who is lost and asks how to get to places in your town." },
+    { id: "hotel", name: "Checking into a hotel", lv: [2, 3], role: "a hotel receptionist", brief: "The learner is checking in. There is a small problem with the booking that you solve together." },
+    { id: "doctor", name: "At the doctor's", lv: [2, 3], role: "a family doctor (GP)", brief: "The learner is a patient who feels unwell. Ask about symptoms and give simple advice. Don't give real medical advice; keep it a role-play." },
+    { id: "party", name: "Small talk at a party", lv: [2, 4], role: "a guest at a friend's birthday party", brief: "You have just met the learner. Make small talk: how you know the host, work, hobbies, plans." },
+    { id: "flat", name: "Renting a flat", lv: [3, 4], role: "a landlord showing a flat", brief: "The learner wants to rent your flat. Answer and ask questions about rent, bills, the area and the contract." },
+    { id: "complaint", name: "Making a complaint", lv: [3, 4], role: "a customer service agent for an online shop", brief: "The learner's order arrived late and damaged. Handle the complaint politely, and negotiate a solution." },
+    { id: "interview", name: "Job interview", lv: [3, 5], role: "an interviewer for a role the learner chooses", brief: "Start by asking which job they are applying for, then run a realistic interview with follow-up questions." },
+    { id: "salary", name: "Negotiating a pay rise", lv: [4, 6], role: "the learner's manager", brief: "The learner asks for a pay rise. Be friendly but cautious about budget; make them justify it, and look for a compromise." },
+    { id: "debate", name: "Debate: remote work", lv: [4, 6], role: "a debate partner", brief: "Debate whether companies should go back to full-time office work. Take the opposite view to the learner, argue politely and ask them to support their points." },
+    { id: "news", name: "Discussing the news", lv: [5, 6], role: "a well-read friend", brief: "Discuss a current-affairs theme the learner chooses (technology, climate, cities, education). Push for nuance and ask for examples." }
+  ];
+  const LEVEL_GUIDE = {
+    1: "use only very simple, common words and the present tense; sentences of about 5–8 words; speak slowly and clearly",
+    2: "use simple everyday vocabulary; present, past and 'going to' forms; short sentences",
+    3: "use clear everyday English; you can use common phrasal verbs, but avoid rare idioms",
+    4: "use natural English with some common idioms and a range of tenses",
+    5: "use natural, idiomatic English with varied structures and some advanced vocabulary",
+    6: "use fully natural, nuanced, idiomatic English, as you would with an educated native speaker"
+  };
+  const REPLY_LEN = (n) => (n <= 2 ? "1–2 short sentences" : n <= 4 ? "2–3 sentences" : "2–4 sentences");
+
+  function systemPrompt(level, sc, unit) {
+    const L = lvl(level);
+    const brief = sc.id === "unit" && unit
+      ? `Chat about the topic "${unit.topic}" (unit: "${unit.title}"). Create chances for the learner to use ${unit.grammar.title} and some of these words: ${unit.vocab.map((v) => v[0]).join(", ")}. Don't announce this; just steer the conversation naturally.`
+      : sc.brief;
+    return `You are an English conversation partner on LevelUp English, a website where people practise English. The learner's level is ${L.code} (${L.name}) on the CEFR scale.
+
+Scenario: ${brief}
+Your role: ${sc.role}.
+
+How to talk:
+- Write only in English and pitch it to the learner's level: ${LEVEL_GUIDE[level]}.
+- Keep every reply short, ${REPLY_LEN(level)}, and usually end with a question or prompt that keeps the conversation going.
+- Stay in your role during role-plays. Be warm, natural and curious. Don't lecture or explain grammar in the reply itself.
+- If the learner writes in another language, seems stuck or asks for help, help briefly in simple English and give them a phrase they could use.
+- This is English practice only. If asked to do unrelated work (write code, homework, long essays), say kindly that you're here for conversation practice and carry on the chat.
+- Keep the conversation suitable for all ages.
+
+After your reply, write a line containing exactly ###, then feedback on the learner's most recent message only:
+- One line per real mistake (grammar, wrong word, clearly unnatural phrasing) in the form: - original → corrected — short reason
+- At most 3 lines, most important first.
+- If there are no mistakes, write: - none
+- You may add one line starting with "- tip:" to suggest a more natural way to say something.
+- Ignore capital letters, missing full stops and typos that are obviously just typing slips.
+For your very first message, when the learner hasn't written anything yet, the feedback is: - none`;
+  }
+
+  /* Split a streamed reply into the conversational part and the feedback part. */
+  function splitReply(text) {
+    const i = text.indexOf("###");
+    if (i < 0) return { reply: text.replace(/#{1,2}\s*$/, ""), fb: null };
+    return { reply: text.slice(0, i).trim(), fb: text.slice(i + 3).trim() };
+  }
+  function parseFeedback(fb) {
+    if (!fb) return { fixes: [], tip: "" };
+    const fixes = []; let tip = "";
+    fb.split("\n").map((l) => l.replace(/^\s*[-•*]\s*/, "").trim()).filter(Boolean).forEach((l) => {
+      if (/^none\.?$/i.test(l)) return;
+      if (/^tip:/i.test(l)) { tip = l.replace(/^tip:\s*/i, ""); return; }
+      const m = l.match(/^(.*?)\s*(?:→|->)\s*(.*?)(?:\s+[—–-]{1,2}\s+(.*))?$/);
+      if (m) fixes.push({ from: m[1].replace(/^["“']|["”']$/g, ""), to: m[2].replace(/^["“']|["”']$/g, ""), why: m[3] || "" });
+    });
+    return { fixes: fixes.slice(0, 3), tip };
+  }
+
+  let TALK = null; // current conversation
+
+  function talkPage(params) {
+    if (!hasAI()) return talkSetup();
+    if (TALK && TALK.messages.length && params.get("new") !== "1") return talkChat();
+    const level = Math.min(6, Math.max(1, +params.get("l") || state.level || 2));
+    const unit = unitsOf(level).find((u) => !unitDone(u.id)) || unitsOf(level)[0];
+    const fits = (s) => level >= s.lv[0] && level <= s.lv[1];
+    app.innerHTML = `
+    <section class="page-head"><p class="kicker">Conversation practice &middot; AI partner</p>
+      <h1 class="display">Talk it through</h1>
+      <p class="lede">Have a real conversation in English with an AI partner. Type or speak, and you'll get quick corrections after every message and written feedback at the end.</p></section>
+    <section class="controls">
+      <div class="seg" role="group" aria-label="Level">${LEVELS.map((x) => `<button data-l="${x.n}" class="${x.n === level ? "on" : ""}">${x.code}</button>`).join("")}</div>
+      <label class="check"><input type="checkbox" id="t-voice" ${state.settings.talkVoice !== false && hasTTS ? "checked" : ""} ${hasTTS ? "" : "disabled"}> Read replies aloud</label>
+    </section>
+    <section>
+      <h2 class="h-section">Choose a situation</h2>
+      <div class="table-list">
+        ${SCENARIOS.filter(fits).map((s) => scenarioRow(s, level, unit)).join("")}
+      </div>
+      <details class="more-sc"><summary>Situations for other levels</summary><div class="table-list">${SCENARIOS.filter((s) => !fits(s)).map((s) => scenarioRow(s, level, unit)).join("")}</div></details>
+    </section>
+    <section class="danger">${CFG.aiProxy ? "" : `<button class="btn-text" id="t-forget">Remove my API key from this browser</button>`}</section>`;
+    $$(".seg [data-l]").forEach((b) => (b.onclick = () => { location.hash = `#/talk?new=1&l=${b.dataset.l}`; }));
+    $("#t-voice").onchange = (e) => { state.settings.talkVoice = e.target.checked; save(); };
+    if ($("#t-forget")) $("#t-forget").onclick = () => { try { localStorage.removeItem(AI_KEY_STORE); } catch (e) { /* ignore */ } TALK = null; talkSetup(); };
+    $$("[data-sc]").forEach((b) => (b.onclick = () => {
+      const sc = SCENARIOS.find((s) => s.id === b.dataset.sc);
+      TALK = { level, sc, unit: sc.id === "unit" ? unit : null, messages: [], turns: [], busy: false, ended: false };
+      talkChat();
+      talkSend(null);
+    }));
+  }
+  function scenarioRow(s, level, unit) {
+    const sub = s.id === "unit" ? `${lvl(level).code} &middot; ${esc(unit.title)}: ${esc(unit.grammar.title)}` : `${lvl(s.lv[0]).code}${s.lv[1] !== s.lv[0] ? "–" + lvl(s.lv[1]).code : ""} &middot; you talk to ${esc(s.role.replace(/^(a|an|the) /, "a "))}`;
+    return `<button class="row-link sc-row" data-sc="${s.id}"><span class="row-title">${esc(s.name)}<span class="row-sub">${sub}</span></span><span class="row-meta">Start &rarr;</span></button>`;
+  }
+
+  function talkSetup() {
+    app.innerHTML = `
+    <section class="page-head narrow"><p class="kicker">Conversation practice &middot; AI partner</p>
+      <h1 class="display">Talk it through</h1>
+      <p class="lede">Practise real conversations with an AI partner powered by Claude. You get corrections after every message and feedback at the end.</p></section>
+    <section class="settings">
+      <div class="boxed" style="margin-top:0">
+        <h3>Connect with your own API key</h3>
+        <p>The AI partner runs on Anthropic's Claude. To use it here you need an Anthropic API key from <b>console.anthropic.com</b>. Usage is billed to your Anthropic account: a 20-message chat typically costs roughly $0.10–0.40.</p>
+        <ul class="list-check small">
+          <li>Your key is stored only in this browser and sent only to Anthropic.</li>
+          <li>It isn't included in backups or transfer codes.</li>
+          <li>Anyone who uses this browser can use it, so don't save it on a shared computer.</li>
+        </ul>
+      </div>
+      <label class="field"><span>Anthropic API key</span><input id="t-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…"></label>
+      <div class="actions"><button class="btn" id="t-save">Save and continue</button><span id="t-msg" class="small t-bad"></span></div>
+    </section>`;
+    $("#t-save").onclick = () => {
+      const k = $("#t-key").value.trim();
+      if (!/^sk-ant-/.test(k) || k.length < 30) { $("#t-msg").textContent = "That doesn't look like an Anthropic API key (it starts with sk-ant-)."; return; }
+      try { localStorage.setItem(AI_KEY_STORE, k); } catch (e) { $("#t-msg").textContent = "This browser won't let the site save the key."; return; }
+      location.hash = "#/talk?new=1";
+    };
+  }
+
+  function talkChat() {
+    const T2 = TALK;
+    const L = lvl(T2.level);
+    app.innerHTML = `
+    <nav class="crumbs"><a href="#/talk?new=1">Conversation practice</a> / ${esc(T2.sc.name)}</nav>
+    <section class="talk-head"><div><p class="kicker">${L.code} &middot; ${esc(T2.sc.role)}</p><h1 class="display display-sm">${esc(T2.sc.name)}</h1></div>
+      <div class="actions"><button class="btn btn-line btn-sm" id="t-end">Finish and get feedback</button></div></section>
+    <section class="chat" id="chat" aria-live="polite"></section>
+    <form class="composer" id="composer">
+      <textarea id="t-in" rows="2" placeholder="Write your reply…" maxlength="1200"></textarea>
+      <div class="composer-actions">
+        ${SR ? `<button type="button" class="btn btn-line btn-sm" id="t-mic">${ICON_MIC} Speak</button>` : ""}
+        <span class="mono" id="t-count"></span>
+        <button class="btn" id="t-send" type="submit">Send</button>
+      </div>
+    </form>
+    <p class="muted small talk-note">AI replies can contain mistakes. Corrections are suggestions, not a teacher's marking.</p>`;
+    renderTurns();
+    const inp = $("#t-in");
+    $("#composer").onsubmit = (e) => { e.preventDefault(); const v = inp.value.trim(); if (v && !TALK.busy) { inp.value = ""; talkSend(v); } };
+    inp.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#composer").requestSubmit ? $("#composer").requestSubmit() : $("#t-send").click(); } };
+    $("#t-end").onclick = () => talkFinish();
+    if ($("#t-mic")) $("#t-mic").onclick = () => dictate(inp, $("#t-mic"));
+    updateComposer();
+  }
+  function updateComposer() {
+    if (!$("#t-send")) return;
+    const learnerTurns = TALK.turns.filter((t) => t.who === "me").length;
+    $("#t-send").disabled = TALK.busy || learnerTurns >= MAX_TURNS;
+    $("#t-count").textContent = learnerTurns ? `${learnerTurns}/${MAX_TURNS}` : "";
+    $("#t-end").disabled = TALK.busy || learnerTurns < 2;
+    if (learnerTurns >= MAX_TURNS) $("#t-in").placeholder = "That's the end of this conversation. Get your feedback.";
+  }
+  function dictate(inp, btn) {
+    let rec;
+    try { rec = new SR(); } catch (e) { return; }
+    rec.lang = "en-GB"; rec.interimResults = false; rec.maxAlternatives = 1;
+    btn.disabled = true; btn.lastChild.textContent = " Listening…";
+    rec.onresult = (ev) => { const t = ev.results[0][0].transcript; inp.value = (inp.value ? inp.value + " " : "") + t; inp.focus(); };
+    rec.onerror = (ev) => { if (ev.error === "not-allowed") alertLine("Microphone permission was denied."); };
+    rec.onend = () => { btn.disabled = false; btn.lastChild.textContent = " Speak"; };
+    rec.start();
+  }
+  function alertLine(msg) { const c = $("#chat"); if (c) c.insertAdjacentHTML("beforeend", `<div class="chat-error">${esc(msg)}</div>`); }
+
+  function turnHTML(t, i) {
+    if (t.who === "me") {
+      const f = t.fb;
+      return `<div class="msg msg-me"><div class="bubble">${esc(t.text)}</div>
+        ${f ? (f.fixes.length || f.tip
+          ? `<div class="fix">${f.fixes.map((x) => `<div><s>${esc(x.from)}</s> <span aria-hidden="true">→</span> <b>${esc(x.to)}</b>${x.why ? `<span class="muted"> · ${esc(x.why)}</span>` : ""}</div>`).join("")}${f.tip ? `<div class="muted">Tip: ${esc(f.tip)}</div>` : ""}</div>`
+          : `<div class="fix fix-ok">No mistakes.</div>`) : ""}</div>`;
+    }
+    return `<div class="msg msg-ai"><span class="who">${esc(TALK.sc.id === "free" || TALK.sc.id === "unit" ? "Partner" : TALK.sc.role.replace(/^(a|an|the) /, ""))}</span>
+      <div class="bubble">${t.text ? esc(t.text) : `<span class="typing"><i></i><i></i><i></i></span>`}</div>
+      ${t.text && hasTTS ? `<button class="say" data-speak="${esc(t.text)}" aria-label="Listen">${ICON_SPEAKER}</button>` : ""}</div>`;
+  }
+  function renderTurns() {
+    const c = $("#chat");
+    if (!c) return;
+    c.innerHTML = TALK.turns.map(turnHTML).join("") || "";
+    c.lastElementChild && c.lastElementChild.scrollIntoView({ block: "nearest" });
+  }
+
+  async function talkSend(text) {
+    const T2 = TALK;
+    if (!T2 || T2.busy) return;
+    T2.busy = true;
+    if (text) {
+      T2.messages.push({ role: "user", content: text });
+      T2.turns.push({ who: "me", text, fb: null });
+      logActivity(1);
+    } else {
+      T2.messages.push({ role: "user", content: "[The learner has just opened the chat. Greet them and start the conversation with your first question.]" });
+    }
+    const me = text ? T2.turns[T2.turns.length - 1] : null;
+    const ai = { who: "ai", text: "" };
+    T2.turns.push(ai);
+    renderTurns(); updateComposer();
+    let Anthropic = null;
+    let full = "";
+    try {
+      const r = await aiClient();
+      Anthropic = r.Anthropic;
+      const stream = r.client.beta.messages.stream({
+        model: AI_MODEL,
+        max_tokens: 4000,
+        system: systemPrompt(T2.level, T2.sc, T2.unit),
+        messages: T2.messages,
+        output_config: { effort: "low" },
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default"
+      });
+      for await (const ev of stream) {
+        if (TALK !== T2) return;
+        if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
+          full += ev.delta.text;
+          const bubble = $("#chat .msg-ai:last-child .bubble");
+          const shown = splitReply(full).reply;
+          if (bubble && shown) bubble.textContent = shown;
+        }
+      }
+      const final = await stream.finalMessage();
+      if (final.stop_reason === "refusal") throw new Error("refusal");
+      if (TALK !== T2) return;
+      const { reply, fb } = splitReply(full);
+      ai.text = reply || "Sorry, could you say that again?";
+      if (me) me.fb = parseFeedback(fb);
+      T2.messages.push({ role: "assistant", content: full });
+      T2.busy = false;
+      renderTurns(); updateComposer();
+      save();
+      if (state.settings.talkVoice !== false && hasTTS) speak(ai.text, 1);
+      const inp = $("#t-in"); if (inp && window.matchMedia("(pointer: fine)").matches) inp.focus();
+    } catch (err) {
+      if (TALK !== T2) return;
+      T2.turns.pop();
+      T2.messages.pop();
+      if (me) { T2.turns.pop(); const inp = $("#t-in"); if (inp && !inp.value) inp.value = text; }
+      T2.busy = false;
+      renderTurns(); updateComposer();
+      alertLine(err && err.message === "refusal" ? "The partner couldn't reply to that. Try saying it a different way." : aiErrorText(err, Anthropic));
+      if (!text && !T2.turns.length) {
+        $("#chat").insertAdjacentHTML("beforeend", `<div class="actions"><button class="btn btn-sm" id="t-retry">Try again</button></div>`);
+        $("#t-retry").onclick = () => { $("#t-retry").parentElement.remove(); talkSend(null); };
+      }
+    }
+  }
+
+  const FEEDBACK_SCHEMA = {
+    type: "object",
+    additionalProperties: false,
+    required: ["level", "summary", "strengths", "work_on", "phrases"],
+    properties: {
+      level: { type: "string", enum: ["A1", "A2", "B1", "B2", "C1", "C2"] },
+      summary: { type: "string" },
+      strengths: { type: "array", items: { type: "string" } },
+      work_on: { type: "array", items: { type: "object", additionalProperties: false, required: ["point", "example"], properties: { point: { type: "string" }, example: { type: "string" } } } },
+      phrases: { type: "array", items: { type: "string" } }
+    }
+  };
+
+  async function talkFinish() {
+    const T2 = TALK;
+    if (!T2 || T2.busy) return;
+    T2.busy = true; updateComposer();
+    $("#t-end").textContent = "Writing your feedback…";
+    let Anthropic = null;
+    try {
+      const r = await aiClient();
+      Anthropic = r.Anthropic;
+      const msgs = T2.messages.concat([{ role: "user", content: `[The learner has finished the conversation. Now act as their English teacher and assess the learner's messages in this conversation (not your own). Write in simple English suited to ${lvl(T2.level).code}, addressed to the learner as "you". Give: your estimate of the CEFR level their messages show; a two-sentence summary; 2–3 specific strengths; the 3 most useful things to work on, each with a corrected example taken from what they wrote; and 3–5 useful phrases for this situation.]` }]);
+      const stream = r.client.beta.messages.stream({
+        model: AI_MODEL,
+        max_tokens: 8000,
+        system: systemPrompt(T2.level, T2.sc, T2.unit),
+        messages: msgs,
+        output_config: { effort: "low", format: { type: "json_schema", schema: FEEDBACK_SCHEMA } },
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default"
+      });
+      const final = await stream.finalMessage();
+      if (final.stop_reason === "refusal") throw new Error("refusal");
+      const txt = final.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+      const fb = JSON.parse(txt);
+      T2.busy = false; T2.ended = true;
+      const entry = { type: "talk", date: new Date().toISOString(), level: T2.level, scenario: T2.sc.name, est: fb.level, turns: T2.turns.filter((t) => t.who === "me").length };
+      state.history.unshift(entry);
+      logActivity(5);
+      save();
+      renderTalkFeedback(T2, fb);
+    } catch (err) {
+      T2.busy = false;
+      if (TALK !== T2) return;
+      updateComposer();
+      $("#t-end").textContent = "Finish and get feedback";
+      alertLine(err instanceof SyntaxError ? "The feedback came back in an unexpected format. Try again." : err && err.message === "refusal" ? "Couldn't write feedback for this conversation." : aiErrorText(err, Anthropic));
+    }
+  }
+
+  function renderTalkFeedback(T2, fb) {
+    const L = lvl(T2.level);
+    const estN = LEVELS.find((x) => x.code === fb.level);
+    const corrections = T2.turns.filter((t) => t.who === "me" && t.fb && t.fb.fixes.length);
+    app.innerHTML = `
+    <nav class="crumbs"><a href="#/talk?new=1">Conversation practice</a> / Feedback</nav>
+    <section class="result-head"><div>
+      <p class="kicker">${esc(T2.sc.name)} &middot; practised at ${L.code}</p>
+      <h1 class="display">Your messages read like <em>${esc(fb.level)}</em>.</h1>
+      <p class="lede">${esc(fb.summary)}</p>
+      <p class="result-meta">AI estimate from one conversation. Your placement test gives a more reliable level.</p>
+    </div><div class="result-code" aria-hidden="true">${esc(fb.level)}</div></section>
+    ${estN ? ruler(estN.n, { compact: true }) : ""}
+    <section class="cols band">
+      <div><h2 class="h-section">What went well</h2><ul class="list-check">${fb.strengths.map((s) => `<li>${esc(s)}</li>`).join("")}</ul></div>
+      <div><h2 class="h-section">Work on</h2><ol class="list-num">${fb.work_on.map((w) => `<li><b>${esc(w.point)}</b><br><span class="muted">${esc(w.example)}</span></li>`).join("")}</ol></div>
+    </section>
+    <section class="cols band">
+      <div><h2 class="h-section">Useful phrases</h2><ul class="examples">${fb.phrases.map((p) => `<li>${sayBtn(p)}<span>${esc(p)}</span></li>`).join("")}</ul></div>
+      <div><h2 class="h-section">Corrections from this chat</h2>${corrections.length ? `<div class="fix-list">${corrections.map((t) => t.fb.fixes.map((x) => `<div><s>${esc(x.from)}</s> → <b>${esc(x.to)}</b>${x.why ? `<span class="muted"> · ${esc(x.why)}</span>` : ""}</div>`).join("")).join("")}</div>` : `<p class="muted">No corrections. Nice work.</p>`}</div>
+    </section>
+    <section class="band cta-line"><p>Keep the momentum going.</p>
+      <div class="actions"><a class="btn" href="#/talk?new=1&l=${T2.level}">New conversation</a><a class="btn btn-line" href="#/practice?l=${state.level || T2.level}">Practise questions</a></div></section>`;
+    TALK = null;
+  }
 
   /* ---------- boot ---------- */
   $(".nav-toggle").onclick = () => $(".nav").classList.toggle("open");

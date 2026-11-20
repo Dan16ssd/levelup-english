@@ -11,6 +11,7 @@ A free, static English-learning site:
 - **Vocabulary review** with spaced repetition: unit words come back after 1, 2, 4, 8… days.
 - **Daily goal and day streak** on the progress page.
 - **Shareable certificate** after the placement test: add your name, print or save it as a PDF, or share a link (the result is encoded in the link, so no server is needed).
+- **AI conversation partner** (Talk page) powered by Claude: role-plays and free conversation pitched to your level, by text or voice, with corrections after every message and written feedback at the end. Learners can use their own Anthropic API key, or the site owner can deploy the optional proxy in `worker/` so it works for everyone (see `worker/README.md`).
 - **Voice settings**: pick the most natural voice on your device and set the speed.
 - **Backup and transfer**: copy a transfer code or download a backup file to move progress to another device without an account.
 - **Level tests** (16 fresh questions each time). Score 70% to move up.

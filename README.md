@@ -11,7 +11,10 @@ A free, static English-learning site:
 - **Vocabulary review** with spaced repetition: unit words come back after 1, 2, 4, 8… days.
 - **Daily goal and day streak** on the progress page.
 - **Shareable certificate** after the placement test: add your name, print or save it as a PDF, or share a link (the result is encoded in the link, so no server is needed).
-- **AI conversation partner** (Talk page) powered by Claude: role-plays and free conversation pitched to your level, by text or voice, with corrections after every message and written feedback at the end. Learners can use their own Anthropic API key, or the site owner can deploy the optional proxy in `worker/` so it works for everyone (see `worker/README.md`).
+- **AI conversation partner** (Talk page): role-plays and free conversation pitched to your level, by text or voice, with corrections after every message and written feedback at the end. Three ways to run it:
+  - **Free, on your device**: an open-source model (Llama 3.2, via WebLLM) downloads once and runs in the browser with WebGPU. No key, no cost, messages stay on the device.
+  - **Claude with your own API key**: best quality, billed to your Anthropic account.
+  - **Claude for everyone**: the site owner deploys the proxy in `worker/` (see `worker/README.md`) and pays for usage.
 - **Voice settings**: pick the most natural voice on your device and set the speed.
 - **Backup and transfer**: copy a transfer code or download a backup file to move progress to another device without an account.
 - **Level tests** (16 fresh questions each time). Score 70% to move up.

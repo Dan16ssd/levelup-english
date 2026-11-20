@@ -1372,33 +1372,156 @@
 
 
   /* =========================================================
-     AI CONVERSATION PARTNER (Claude)
+     AI CONVERSATION PARTNER
+     Three ways to run it: a free open model in the learner's browser (WebGPU),
+     Claude with the learner's own key, or Claude through the site owner's proxy.
      ========================================================= */
   const CFG = window.LU_CONFIG || {};
   const AI_KEY_STORE = "levelup-ai-key"; // kept apart from progress so it never ends up in backups or transfer codes
+  const PROVIDER_STORE = "levelup-ai-provider";
+  const LOCAL_SIZE_STORE = "levelup-ai-local-size";
   const AI_MODEL = CFG.aiModel || "claude-opus-5-5";
   const SDK_URL = "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.6.0/+esm";
+  const WEBLLM_URL = "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.87/+esm";
+  const LOCAL_MODELS = {
+    standard: { base: "Llama-3.2-3B-Instruct", label: "Standard", size: "about 1.8 GB", note: "better conversations; best on a computer" },
+    lite: { base: "Llama-3.2-1B-Instruct", label: "Lite", size: "about 0.7 GB", note: "faster and lighter; for phones and older computers" }
+  };
   const MAX_TURNS = 40;
-  const getAIKey = () => { try { return localStorage.getItem(AI_KEY_STORE) || ""; } catch (e) { return ""; } };
-  const hasAI = () => !!(CFG.aiProxy || getAIKey());
+  const lsGet = (k) => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } };
+  const lsSet = (k, v) => { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); return true; } catch (e) { return false; } };
+  const getAIKey = () => lsGet(AI_KEY_STORE);
+  function aiProvider() {
+    if (CFG.aiProxy) return "proxy";
+    const p = lsGet(PROVIDER_STORE);
+    if (p === "claude" && getAIKey()) return "claude";
+    if (p === "local") return "local";
+    return "";
+  }
+  const hasAI = () => !!aiProvider();
+  /* Default to the smaller model on phones and low-memory devices. */
+  const smallDevice = () => (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) || (navigator.deviceMemory && navigator.deviceMemory <= 4);
+  const localSize = () => { const v = lsGet(LOCAL_SIZE_STORE); return v === "lite" || v === "standard" ? v : smallDevice() ? "lite" : "standard"; };
+  const providerLabel = () => ({ proxy: "Claude", claude: "Claude (your API key)", local: `free on-device model (${LOCAL_MODELS[localSize()].label})` })[aiProvider()] || "not set up";
 
+  /* ---- Claude (official Anthropic SDK) ---- */
+  let AnthropicCls = null;
   let sdkPromise = null;
   function loadSDK() {
-    if (!sdkPromise) sdkPromise = import(SDK_URL).then((m) => m.default || m.Anthropic).catch((e) => { sdkPromise = null; throw e; });
+    if (!sdkPromise) sdkPromise = import(SDK_URL).then((m) => (AnthropicCls = m.default || m.Anthropic)).catch((e) => { sdkPromise = null; throw e; });
     return sdkPromise;
   }
   async function aiClient() {
     const Anthropic = await loadSDK();
-    if (CFG.aiProxy) return { Anthropic, client: new Anthropic({ apiKey: "via-proxy", baseURL: CFG.aiProxy.replace(/\/+$/, ""), dangerouslyAllowBrowser: true, maxRetries: 1 }) };
-    return { Anthropic, client: new Anthropic({ apiKey: getAIKey(), dangerouslyAllowBrowser: true, maxRetries: 1 }) };
+    if (CFG.aiProxy) return new Anthropic({ apiKey: "via-proxy", baseURL: CFG.aiProxy.replace(/\/+$/, ""), dangerouslyAllowBrowser: true, maxRetries: 1 });
+    return new Anthropic({ apiKey: getAIKey(), dangerouslyAllowBrowser: true, maxRetries: 1 });
   }
-  function aiErrorText(err, Anthropic) {
-    if (Anthropic && err instanceof Anthropic.AuthenticationError) return CFG.aiProxy ? "The conversation service rejected the request. Please try again later." : "Your API key wasn't accepted. Check it and enter it again.";
-    if (Anthropic && err instanceof Anthropic.PermissionDeniedError) return "This API key isn't allowed to use the model. Check your Anthropic account.";
-    if (Anthropic && err instanceof Anthropic.RateLimitError) return "Too many messages in a short time. Wait a minute and try again.";
-    if (Anthropic && err instanceof Anthropic.BadRequestError) return /credit|billing/i.test(err.message) ? "Your Anthropic account has no credit left. Add credit in the Anthropic Console." : "The request was rejected: " + err.message;
-    if (Anthropic && err instanceof Anthropic.APIConnectionError) return "Couldn't reach the conversation service. Check your internet connection.";
-    if (Anthropic && err instanceof Anthropic.APIError) return "The conversation service had a problem (" + (err.status || "error") + "). Try again in a moment.";
+
+  /* ---- Free model in the browser (WebLLM + WebGPU) ---- */
+  let gpuInfo = null;
+  async function checkGPU() {
+    if (gpuInfo) return gpuInfo;
+    try {
+      const a = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+      gpuInfo = a ? { ok: true, f16: a.features.has("shader-f16") } : { ok: false };
+    } catch (e) { gpuInfo = { ok: false }; }
+    return gpuInfo;
+  }
+  let engineP = null, engineId = "", progressCb = null;
+  async function localEngine() {
+    const g = await checkGPU();
+    if (!g.ok) { const e = new Error("nogpu"); e.code = "nogpu"; throw e; }
+    const id = `${LOCAL_MODELS[localSize()].base}-${g.f16 ? "q4f16_1" : "q4f32_1"}-MLC`;
+    if (engineP && engineId === id) return engineP;
+    if (engineP) engineP.then((e) => e.unload()).catch(() => {});
+    engineId = id;
+    engineP = import(WEBLLM_URL)
+      .then((m) => m.CreateMLCEngine(id, { initProgressCallback: (r) => progressCb && progressCb(r) }))
+      .catch((e) => { engineP = null; throw e; });
+    return engineP;
+  }
+  /* Small models are much better at one focused job, so on-device corrections are a separate step. */
+  const CHECK_SYSTEM = `You are a careful English teacher. You will get one message written by an English learner. Find real mistakes in grammar, word forms, plurals, verb tenses and word choice.
+Answer only with lines in this format, at most 3 lines:
+- wrong words → corrected words — short reason
+If the message has no real mistakes, answer only: - none
+Only correct things that are actually wrong. Never change a correct sentence just to make it more formal or polite: "Hi", "I want a coffee" and "Yes please" are correct.
+Check every verb: if the message talks about the past (yesterday, last week, ago), the verb must be in the past tense.
+Ignore capital letters, missing full stops and obvious typing slips.`;
+  const CHECK_SHOTS = [
+    ["I goed to the park yesterday and I see many dog.", "- I goed → I went — 'go' is irregular: went\n- I see many dog → I saw many dogs — past tense, and plural after 'many'"],
+    ["Can I have a cup of tea, please?", "- none"],
+    ["Hi, I want a sandwich and a juice.", "- none"],
+    ["Last week I buy two book.", "- I buy → I bought — past tense after 'last week'\n- two book → two books — plural after 'two'"],
+    ["She don't like coffee but she like tea.", "- She don't like → She doesn't like — he/she/it takes 'doesn't'\n- she like tea → she likes tea — add -s for he/she/it"]
+  ];
+  async function localCorrections(text) {
+    const engine = await localEngine();
+    const messages = [{ role: "system", content: CHECK_SYSTEM }];
+    CHECK_SHOTS.forEach(([u, a]) => { messages.push({ role: "user", content: u }); messages.push({ role: "assistant", content: a }); });
+    messages.push({ role: "user", content: text });
+    const r = await engine.chat.completions.create({ messages, max_tokens: 160, temperature: 0 });
+    return (r.choices[0].message.content || "").trim();
+  }
+  /* Small models have short memories: keep the opening message and the most recent exchanges. */
+  const trimForLocal = (msgs) => (msgs.length <= 13 ? msgs : [msgs[0]].concat(msgs.slice(-12)));
+
+  /* One function for every provider. Streams text through onText and returns the full text. */
+  async function aiGenerate({ system, messages, maxTokens, schema, onText, onProgress }) {
+    if (aiProvider() === "local") {
+      progressCb = onProgress || null;
+      const engine = await localEngine();
+      progressCb = null;
+      const chunks = await engine.chat.completions.create({
+        messages: [{ role: "system", content: system }].concat(trimForLocal(messages)),
+        stream: true,
+        max_tokens: schema ? 700 : 320,
+        temperature: schema ? 0.2 : 0.7,
+        frequency_penalty: schema ? 0.6 : 0.3,
+        ...(schema ? { response_format: { type: "json_object", schema: JSON.stringify(schema) } } : {})
+      });
+      let full = "";
+      for await (const c of chunks) {
+        const d = c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content;
+        if (d) { full += d; if (onText) onText(full); }
+      }
+      return full;
+    }
+    const client = await aiClient();
+    const stream = client.beta.messages.stream({
+      model: AI_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages,
+      output_config: schema ? { effort: "low", format: { type: "json_schema", schema } } : { effort: "low" },
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default"
+    });
+    let full = "";
+    for await (const ev of stream) {
+      if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") { full += ev.delta.text; if (onText) onText(full); }
+    }
+    const final = await stream.finalMessage();
+    if (final.stop_reason === "refusal") { const e = new Error("refusal"); e.code = "refusal"; throw e; }
+    return full;
+  }
+
+  function aiErrorText(err) {
+    if (err && err.code === "refusal") return "The partner couldn't reply to that. Try saying it a different way.";
+    if (aiProvider() === "local") {
+      if (err && err.code === "nogpu") return "This browser can't run the free AI model. Use Chrome or Edge on a computer, or Chrome on a recent Android phone, or choose another option below.";
+      const m = String((err && err.message) || err || "");
+      if (/memory|OOM|allocate|device (was )?lost|DXGI/i.test(m)) return "Your device ran out of memory for the AI model. Switch to the Lite model and try again.";
+      if (/fetch|network|Failed to|download|cache/i.test(m)) return "Downloading the AI model failed. Check your internet connection and try again.";
+      return "The free AI model had a problem: " + m.slice(0, 160);
+    }
+    const A = AnthropicCls;
+    if (A && err instanceof A.AuthenticationError) return CFG.aiProxy ? "The conversation service rejected the request. Please try again later." : "Your API key wasn't accepted. Check it and enter it again.";
+    if (A && err instanceof A.PermissionDeniedError) return "This API key isn't allowed to use the model. Check your Anthropic account.";
+    if (A && err instanceof A.RateLimitError) return "Too many messages in a short time. Wait a minute and try again.";
+    if (A && err instanceof A.BadRequestError) return /credit|billing/i.test(err.message) ? "Your Anthropic account has no credit left. Add credit in the Anthropic Console." : "The request was rejected: " + err.message;
+    if (A && err instanceof A.APIConnectionError) return "Couldn't reach the conversation service. Check your internet connection.";
+    if (A && err instanceof A.APIError) return "The conversation service had a problem (" + (err.status || "error") + "). Try again in a moment.";
     return "Couldn't load the conversation service. Check your connection and try again.";
   }
 
@@ -1427,7 +1550,7 @@
   };
   const REPLY_LEN = (n) => (n <= 2 ? "1–2 short sentences" : n <= 4 ? "2–3 sentences" : "2–4 sentences");
 
-  function systemPrompt(level, sc, unit) {
+  function systemPrompt(level, sc, unit, withFeedback = true) {
     const L = lvl(level);
     const brief = sc.id === "unit" && unit
       ? `Chat about the topic "${unit.topic}" (unit: "${unit.title}"). Create chances for the learner to use ${unit.grammar.title} and some of these words: ${unit.vocab.map((v) => v[0]).join(", ")}. Don't announce this; just steer the conversation naturally.`
@@ -1443,7 +1566,7 @@ How to talk:
 - Stay in your role during role-plays. Be warm, natural and curious. Don't lecture or explain grammar in the reply itself.
 - If the learner writes in another language, seems stuck or asks for help, help briefly in simple English and give them a phrase they could use.
 - This is English practice only. If asked to do unrelated work (write code, homework, long essays), say kindly that you're here for conversation practice and carry on the chat.
-- Keep the conversation suitable for all ages.
+- Keep the conversation suitable for all ages.${withFeedback ? `
 
 After your reply, write a line containing exactly ###, then feedback on the learner's most recent message only:
 - One line per real mistake (grammar, wrong word, clearly unnatural phrasing) in the form: - original → corrected — short reason
@@ -1451,7 +1574,7 @@ After your reply, write a line containing exactly ###, then feedback on the lear
 - If there are no mistakes, write: - none
 - You may add one line starting with "- tip:" to suggest a more natural way to say something.
 - Ignore capital letters, missing full stops and typos that are obviously just typing slips.
-For your very first message, when the learner hasn't written anything yet, the feedback is: - none`;
+For your very first message, when the learner hasn't written anything yet, the feedback is: - none` : "\n- Reply with your message only, with no notes, labels or corrections."}`;
   }
 
   /* Split a streamed reply into the conversational part and the feedback part. */
@@ -1469,7 +1592,9 @@ For your very first message, when the learner hasn't written anything yet, the f
       const m = l.match(/^(.*?)\s*(?:→|->)\s*(.*?)(?:\s+[—–-]{1,2}\s+(.*))?$/);
       if (m) fixes.push({ from: m[1].replace(/^["“']|["”']$/g, ""), to: m[2].replace(/^["“']|["”']$/g, ""), why: m[3] || "" });
     });
-    return { fixes: fixes.slice(0, 3), tip };
+    const same = (a, b) => norm(a) === norm(b);
+    const kept = fixes.filter((f) => f.from && f.to && !same(f.from, f.to) && !/^(hi|hello|hey)\b/i.test(f.from.trim()));
+    return { fixes: kept.slice(0, 3), tip };
   }
 
   let TALK = null; // current conversation
@@ -1495,10 +1620,11 @@ For your very first message, when the learner hasn't written anything yet, the f
       </div>
       <details class="more-sc"><summary>Situations for other levels</summary><div class="table-list">${SCENARIOS.filter((s) => !fits(s)).map((s) => scenarioRow(s, level, unit)).join("")}</div></details>
     </section>
-    <section class="danger">${CFG.aiProxy ? "" : `<button class="btn-text" id="t-forget">Remove my API key from this browser</button>`}</section>`;
+    <section class="danger"><span class="muted small">AI: ${esc(providerLabel())}</span>${CFG.aiProxy ? "" : ` &middot; <button class="btn-text" id="t-change">Change</button>`}${!CFG.aiProxy && getAIKey() ? ` &middot; <button class="btn-text" id="t-forget">Remove my API key</button>` : ""}</section>`;
     $$(".seg [data-l]").forEach((b) => (b.onclick = () => { location.hash = `#/talk?new=1&l=${b.dataset.l}`; }));
     $("#t-voice").onchange = (e) => { state.settings.talkVoice = e.target.checked; save(); };
-    if ($("#t-forget")) $("#t-forget").onclick = () => { try { localStorage.removeItem(AI_KEY_STORE); } catch (e) { /* ignore */ } TALK = null; talkSetup(); };
+    if ($("#t-change")) $("#t-change").onclick = () => { TALK = null; talkSetup(); };
+    if ($("#t-forget")) $("#t-forget").onclick = () => { lsSet(AI_KEY_STORE, ""); if (lsGet(PROVIDER_STORE) === "claude") lsSet(PROVIDER_STORE, ""); TALK = null; talkPage(new URLSearchParams("new=1")); };
     $$("[data-sc]").forEach((b) => (b.onclick = () => {
       const sc = SCENARIOS.find((s) => s.id === b.dataset.sc);
       TALK = { level, sc, unit: sc.id === "unit" ? unit : null, messages: [], turns: [], busy: false, ended: false };
@@ -1512,28 +1638,48 @@ For your very first message, when the learner hasn't written anything yet, the f
   }
 
   function talkSetup() {
+    const size = localSize();
     app.innerHTML = `
     <section class="page-head narrow"><p class="kicker">Conversation practice &middot; AI partner</p>
       <h1 class="display">Talk it through</h1>
-      <p class="lede">Practise real conversations with an AI partner powered by Claude. You get corrections after every message and feedback at the end.</p></section>
-    <section class="settings">
-      <div class="boxed" style="margin-top:0">
-        <h3>Connect with your own API key</h3>
-        <p>The AI partner runs on Anthropic's Claude. To use it here you need an Anthropic API key from <b>console.anthropic.com</b>. Usage is billed to your Anthropic account: a 20-message chat typically costs roughly $0.10–0.40.</p>
-        <ul class="list-check small">
-          <li>Your key is stored only in this browser and sent only to Anthropic.</li>
-          <li>It isn't included in backups or transfer codes.</li>
-          <li>Anyone who uses this browser can use it, so don't save it on a shared computer.</li>
-        </ul>
+      <p class="lede">Practise real conversations with an AI partner. You get corrections after every message and feedback at the end. Choose how to run it:</p></section>
+    <section class="ai-options">
+      <div class="ai-opt">
+        <p class="kicker">Free &middot; no account &middot; private</p>
+        <h3>Free AI on your device</h3>
+        <p>An open-source AI model is downloaded once and then runs inside your browser. It's free, needs no key, and your messages never leave your device.</p>
+        <ul class="list-check small"><li>Needs Chrome or Edge on a computer, or Chrome on a recent Android phone</li><li>First start downloads the model; after that it loads from your browser's storage</li><li>Simpler than Claude: corrections are helpful but sometimes miss mistakes</li></ul>
+        <div class="field"><span>Model size</span>
+          <div class="seg" role="group" aria-label="Model size">${Object.keys(LOCAL_MODELS).map((k) => `<button data-size="${k}" class="${k === size ? "on" : ""}">${LOCAL_MODELS[k].label} &middot; ${LOCAL_MODELS[k].size}</button>`).join("")}</div>
+          <p class="small muted" id="t-size-note">${esc(LOCAL_MODELS[size].note)}</p>
+        </div>
+        <div class="actions"><button class="btn" id="t-local">Use the free AI</button></div>
+        <p class="small" id="t-gpu"></p>
       </div>
-      <label class="field"><span>Anthropic API key</span><input id="t-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…"></label>
-      <div class="actions"><button class="btn" id="t-save">Save and continue</button><span id="t-msg" class="small t-bad"></span></div>
+      <div class="ai-opt">
+        <p class="kicker">Best quality &middot; your Anthropic account</p>
+        <h3>Claude, with your own API key</h3>
+        <p>Claude gives the most natural conversations and the most accurate corrections. You need an API key from <b>console.anthropic.com</b>, and usage is billed to your account: roughly $0.10–0.40 for a 20-message chat.</p>
+        <ul class="list-check small"><li>The key is stored only in this browser and sent only to Anthropic</li><li>It isn't included in backups or transfer codes</li><li>Don't save it on a shared computer</li></ul>
+        <label class="field"><span>Anthropic API key</span><input id="t-key" type="password" autocomplete="off" spellcheck="false" placeholder="${getAIKey() ? "Saved. Paste a new key to replace it" : "sk-ant-…"}"></label>
+        <div class="actions"><button class="btn btn-line" id="t-save">${getAIKey() ? "Use Claude" : "Save key and use Claude"}</button><span id="t-msg" class="small t-bad"></span></div>
+      </div>
     </section>`;
+    $$("[data-size]").forEach((b) => (b.onclick = () => { lsSet(LOCAL_SIZE_STORE, b.dataset.size); $$("[data-size]").forEach((x) => x.classList.toggle("on", x === b)); $("#t-size-note").textContent = LOCAL_MODELS[b.dataset.size].note; }));
+    checkGPU().then((g) => {
+      const el = $("#t-gpu");
+      if (!el) return;
+      if (g.ok) { el.className = "small t-ok"; el.textContent = "Your browser can run the free AI."; }
+      else { el.className = "small t-bad"; el.textContent = "This browser can't run the free AI (it needs WebGPU). Try Chrome or Edge on a computer, or use Claude."; $("#t-local").disabled = true; }
+    });
+    $("#t-local").onclick = () => { lsSet(PROVIDER_STORE, "local"); history.replaceState(null, "", "#/talk?new=1"); router(); };
     $("#t-save").onclick = () => {
       const k = $("#t-key").value.trim();
+      if (!k && getAIKey()) { lsSet(PROVIDER_STORE, "claude"); history.replaceState(null, "", "#/talk?new=1"); router(); return; }
       if (!/^sk-ant-/.test(k) || k.length < 30) { $("#t-msg").textContent = "That doesn't look like an Anthropic API key (it starts with sk-ant-)."; return; }
-      try { localStorage.setItem(AI_KEY_STORE, k); } catch (e) { $("#t-msg").textContent = "This browser won't let the site save the key."; return; }
-      location.hash = "#/talk?new=1";
+      if (!lsSet(AI_KEY_STORE, k)) { $("#t-msg").textContent = "This browser won't let the site save the key."; return; }
+      lsSet(PROVIDER_STORE, "claude");
+      history.replaceState(null, "", "#/talk?new=1"); router();
     };
   }
 
@@ -1616,36 +1762,37 @@ For your very first message, when the learner hasn't written anything yet, the f
     const ai = { who: "ai", text: "" };
     T2.turns.push(ai);
     renderTurns(); updateComposer();
-    let Anthropic = null;
-    let full = "";
+    const bubble = () => $("#chat .msg-ai:last-child .bubble");
     try {
-      const r = await aiClient();
-      Anthropic = r.Anthropic;
-      const stream = r.client.beta.messages.stream({
-        model: AI_MODEL,
-        max_tokens: 4000,
-        system: systemPrompt(T2.level, T2.sc, T2.unit),
+      const local = aiProvider() === "local";
+      const full = await aiGenerate({
+        system: systemPrompt(T2.level, T2.sc, T2.unit, !local),
         messages: T2.messages,
-        output_config: { effort: "low" },
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default"
-      });
-      for await (const ev of stream) {
-        if (TALK !== T2) return;
-        if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
-          full += ev.delta.text;
-          const bubble = $("#chat .msg-ai:last-child .bubble");
-          const shown = splitReply(full).reply;
-          if (bubble && shown) bubble.textContent = shown;
+        maxTokens: 4000,
+        onProgress: (r) => {
+          if (TALK !== T2 || !bubble()) return;
+          const pct = Math.round((r.progress || 0) * 100);
+          const loading = /cache|Loading model from cache/i.test(r.text || "");
+          bubble().innerHTML = `<div class="dl"><b>${loading ? "Loading the free AI model…" : `Downloading the free AI model: ${pct}%`}</b><span class="dl-bar"><i style="width:${pct}%"></i></span><span class="muted small">${loading ? "Almost ready." : `First time only, ${esc(LOCAL_MODELS[localSize()].size)}. Keep this page open.`}</span></div>`;
+        },
+        onText: (t) => {
+          if (TALK !== T2) return;
+          const shown = splitReply(t).reply.replace(/^\s*["“]/, "");
+          if (bubble() && shown) bubble().textContent = shown;
         }
-      }
-      const final = await stream.finalMessage();
-      if (final.stop_reason === "refusal") throw new Error("refusal");
+      });
       if (TALK !== T2) return;
       const { reply, fb } = splitReply(full);
-      ai.text = reply || "Sorry, could you say that again?";
-      if (me) me.fb = parseFeedback(fb);
-      T2.messages.push({ role: "assistant", content: full });
+      ai.text = reply.replace(/^\s*(partner|assistant|ai)\s*:\s*/i, "").trim().replace(/^["“](.*)["”]$/s, "$1") || "Sorry, could you say that again?";
+      T2.messages.push({ role: "assistant", content: local ? ai.text : full });
+      if (me && !local) me.fb = parseFeedback(fb);
+      if (me && local) {
+        renderTurns();
+        const box = $("#chat .msg-me:nth-last-child(2)");
+        if (box) box.insertAdjacentHTML("beforeend", `<div class="fix muted">Checking your message…</div>`);
+        try { me.fb = parseFeedback(await localCorrections(text)); } catch (e) { me.fb = null; }
+        if (TALK !== T2) return;
+      }
       T2.busy = false;
       renderTurns(); updateComposer();
       save();
@@ -1658,10 +1805,12 @@ For your very first message, when the learner hasn't written anything yet, the f
       if (me) { T2.turns.pop(); const inp = $("#t-in"); if (inp && !inp.value) inp.value = text; }
       T2.busy = false;
       renderTurns(); updateComposer();
-      alertLine(err && err.message === "refusal" ? "The partner couldn't reply to that. Try saying it a different way." : aiErrorText(err, Anthropic));
+      alertLine(aiErrorText(err));
+      if (!CFG.aiProxy) $("#chat").insertAdjacentHTML("beforeend", `<p class="small"><a href="#/talk?new=1" id="t-switch">Change how the AI runs</a></p>`);
+      if ($("#t-switch")) $("#t-switch").onclick = (e) => { e.preventDefault(); TALK = null; talkSetup(); };
       if (!text && !T2.turns.length) {
         $("#chat").insertAdjacentHTML("beforeend", `<div class="actions"><button class="btn btn-sm" id="t-retry">Try again</button></div>`);
-        $("#t-retry").onclick = () => { $("#t-retry").parentElement.remove(); talkSend(null); };
+        $("#t-retry").onclick = () => { $("#chat").innerHTML = ""; talkSend(null); };
       }
     }
   }
@@ -1678,47 +1827,80 @@ For your very first message, when the learner hasn't written anything yet, the f
       phrases: { type: "array", items: { type: "string" } }
     }
   };
+  /* Small local models don't support schemas, so accept anything close and fall back to plain text. */
+  function readFeedback(txt) {
+    txt = String(txt || "").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+    const i = txt.indexOf("{");
+    if (i < 0) return null;
+    const closeJSON = (t) => {
+      const stack = []; let inStr = false, escp = false;
+      for (const ch of t) {
+        if (inStr) { if (escp) escp = false; else if (ch === "\\") escp = true; else if (ch === '"') inStr = false; continue; }
+        if (ch === '"') inStr = true; else if (ch === "{" || ch === "[") stack.push(ch); else if (ch === "}" || ch === "]") stack.pop();
+      }
+      let r = t + (inStr ? '"' : "");
+      r = r.replace(/,\s*$/, "").replace(/:\s*$/, ': ""');
+      while (stack.length) r += stack.pop() === "{" ? "}" : "]";
+      return r;
+    };
+    const parse = (t) => { try { return JSON.parse(t); } catch (e) { return null; } };
+    try {
+      const body = txt.slice(i);
+      const o = parse(body.slice(0, body.lastIndexOf("}") + 1)) || parse(closeJSON(body)) || JSON.parse(closeJSON(body.replace(/,\s*"[^"]*"?\s*:?\s*"?[^"{}\[\]]*$/, "")));
+      const arr = (x) => (Array.isArray(x) ? x : x ? [x] : []).map((v) => (typeof v === "string" ? v : v && typeof v === "object" ? v : String(v)));
+      const lv = String(o.level || "").toUpperCase().match(/[ABC][12]/);
+      /* small models can loop and repeat themselves: drop duplicates and keep the lists short */
+      const uniq = (list, key, n) => { const seen = new Set(); return list.filter((x) => { const k = norm(key(x)); if (!k || seen.has(k)) return false; seen.add(k); return true; }).slice(0, n); };
+      return {
+        level: lv ? lv[0] : "",
+        summary: String(o.summary || "").slice(0, 400),
+        strengths: uniq(arr(o.strengths).map(String), (x) => x, 3),
+        work_on: uniq(arr(o.work_on).map((w) => (typeof w === "string" ? { point: w, example: "" } : { point: String(w.point || ""), example: String(w.example || "") })), (w) => w.point, 3),
+        phrases: uniq(arr(o.phrases).map(String), (x) => x, 5)
+      };
+    } catch (e) { return null; }
+  }
 
   async function talkFinish() {
     const T2 = TALK;
     if (!T2 || T2.busy) return;
     T2.busy = true; updateComposer();
     $("#t-end").textContent = "Writing your feedback…";
-    let Anthropic = null;
+    const local = aiProvider() === "local";
     try {
-      const r = await aiClient();
-      Anthropic = r.Anthropic;
-      const msgs = T2.messages.concat([{ role: "user", content: `[The learner has finished the conversation. Now act as their English teacher and assess the learner's messages in this conversation (not your own). Write in simple English suited to ${lvl(T2.level).code}, addressed to the learner as "you". Give: your estimate of the CEFR level their messages show; a two-sentence summary; 2–3 specific strengths; the 3 most useful things to work on, each with a corrected example taken from what they wrote; and 3–5 useful phrases for this situation.]` }]);
-      const stream = r.client.beta.messages.stream({
-        model: AI_MODEL,
-        max_tokens: 8000,
-        system: systemPrompt(T2.level, T2.sc, T2.unit),
-        messages: msgs,
-        output_config: { effort: "low", format: { type: "json_schema", schema: FEEDBACK_SCHEMA } },
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default"
-      });
-      const final = await stream.finalMessage();
-      if (final.stop_reason === "refusal") throw new Error("refusal");
-      const txt = final.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-      const fb = JSON.parse(txt);
+      const ask = `[The learner has finished the conversation. Now act as their English teacher and assess the learner's messages in this conversation (not your own). Write in simple English suited to ${lvl(T2.level).code}, addressed to the learner as "you". Keep every item short (one sentence). Give: your estimate of the CEFR level their messages show; a two-sentence summary; 2–3 specific strengths; the 3 most useful things to work on, each with a corrected example taken from what they wrote; and 3–5 useful phrases for this situation.]` +
+        (local ? `\nReply with only JSON, no other text, in exactly this shape: {"level": "B1", "summary": "...", "strengths": ["..."], "work_on": [{"point": "...", "example": "..."}], "phrases": ["..."]}` : "");
+      const txt = await aiGenerate({ system: systemPrompt(T2.level, T2.sc, T2.unit), messages: T2.messages.concat([{ role: "user", content: ask }]), maxTokens: 8000, schema: FEEDBACK_SCHEMA });
+      if (TALK !== T2) return;
+      const fb = readFeedback(txt);
+      if (!fb && !local) throw new SyntaxError("bad json");
       T2.busy = false; T2.ended = true;
-      const entry = { type: "talk", date: new Date().toISOString(), level: T2.level, scenario: T2.sc.name, est: fb.level, turns: T2.turns.filter((t) => t.who === "me").length };
-      state.history.unshift(entry);
+      state.history.unshift({ type: "talk", date: new Date().toISOString(), level: T2.level, scenario: T2.sc.name, est: (fb && fb.level) || "—", turns: T2.turns.filter((t) => t.who === "me").length });
       logActivity(5);
       save();
-      renderTalkFeedback(T2, fb);
+      renderTalkFeedback(T2, fb, txt);
     } catch (err) {
       T2.busy = false;
       if (TALK !== T2) return;
       updateComposer();
       $("#t-end").textContent = "Finish and get feedback";
-      alertLine(err instanceof SyntaxError ? "The feedback came back in an unexpected format. Try again." : err && err.message === "refusal" ? "Couldn't write feedback for this conversation." : aiErrorText(err, Anthropic));
+      alertLine(err instanceof SyntaxError ? "The feedback came back in an unexpected format. Try again." : aiErrorText(err));
     }
   }
 
-  function renderTalkFeedback(T2, fb) {
+  function renderTalkFeedback(T2, fb, raw) {
     const L = lvl(T2.level);
+    if (!fb || !fb.level) {
+      const corr = T2.turns.filter((t) => t.who === "me" && t.fb && t.fb.fixes.length);
+      app.innerHTML = `
+      <nav class="crumbs"><a href="#/talk?new=1">Conversation practice</a> / Feedback</nav>
+      <section class="page-head"><p class="kicker">${esc(T2.sc.name)} &middot; practised at ${L.code}</p><h1 class="display">Your feedback</h1></section>
+      <section class="cols band"><div><h2 class="h-section">From your AI partner</h2><p class="reading-text" style="white-space:pre-wrap">${esc(String(raw || "").trim())}</p></div>
+      <div><h2 class="h-section">Corrections from this chat</h2>${corr.length ? `<div class="fix-list">${corr.map((t) => t.fb.fixes.map((x) => `<div><s>${esc(x.from)}</s> → <b>${esc(x.to)}</b>${x.why ? `<span class="muted"> · ${esc(x.why)}</span>` : ""}</div>`).join("")).join("")}</div>` : `<p class="muted">No corrections.</p>`}</div></section>
+      <section class="band cta-line"><p>Keep the momentum going.</p><div class="actions"><a class="btn" href="#/talk?new=1&l=${T2.level}">New conversation</a><a class="btn btn-line" href="#/practice?l=${state.level || T2.level}">Practise questions</a></div></section>`;
+      TALK = null;
+      return;
+    }
     const estN = LEVELS.find((x) => x.code === fb.level);
     const corrections = T2.turns.filter((t) => t.who === "me" && t.fb && t.fb.fixes.length);
     app.innerHTML = `
@@ -1732,7 +1914,7 @@ For your very first message, when the learner hasn't written anything yet, the f
     ${estN ? ruler(estN.n, { compact: true }) : ""}
     <section class="cols band">
       <div><h2 class="h-section">What went well</h2><ul class="list-check">${fb.strengths.map((s) => `<li>${esc(s)}</li>`).join("")}</ul></div>
-      <div><h2 class="h-section">Work on</h2><ol class="list-num">${fb.work_on.map((w) => `<li><b>${esc(w.point)}</b><br><span class="muted">${esc(w.example)}</span></li>`).join("")}</ol></div>
+      <div><h2 class="h-section">Work on</h2><ol class="list-num">${fb.work_on.map((w) => `<li><b>${esc(w.point)}</b>${w.example ? `<br><span class="muted">${esc(w.example)}</span>` : ""}</li>`).join("")}</ol></div>
     </section>
     <section class="cols band">
       <div><h2 class="h-section">Useful phrases</h2><ul class="examples">${fb.phrases.map((p) => `<li>${sayBtn(p)}<span>${esc(p)}</span></li>`).join("")}</ul></div>
